@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+release/
+third_party/
+*.spec
+*.egg-info/
+页织工坊 输出/
+validation_output/
+验证输出/
+.tmp_*

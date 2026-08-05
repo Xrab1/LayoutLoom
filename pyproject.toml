@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layoutloom"
+version = "0.1.0"
+description = "页织工坊：本地优先的 PDF、Office、图片与视频批处理桌面工具"
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Programming Language :: Python :: 3",
+  "Topic :: Office/Business",
+]
+dependencies = [
+  "Pillow>=10.0",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.10",
+  "pypdf[crypto]>=5.0",
+  "pdfplumber>=0.11",
+  "pdf2image>=1.17",
+  "pdf2docx>=0.5.13,<0.6",
+  "PyMuPDF>=1.26.7,<1.29",
+  "reportlab>=4.0",
+  "python-docx>=1.1",
+  "openpyxl>=3.1",
+  "python-pptx>=1.0",
+  "pywin32>=306; platform_system == 'Windows'",
+  "tkinterdnd2==0.6.2",
+  "wordninja==2.0.0",
+]
+
+[project.scripts]
+layoutloom = "docuforge.cli:main"
+layoutloom-gui = "docuforge.app:launch"
+
+[tool.setuptools.packages.find]
+include = ["docuforge*"]
+
+[tool.setuptools]
+license-files = ["LICENSE"]

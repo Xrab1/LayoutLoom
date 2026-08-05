@@ -1,0 +1,15 @@
+Pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.10
+pypdf[crypto]>=5.0
+pdfplumber>=0.11
+pdf2image>=1.17
+pdf2docx>=0.5.13,<0.6
+PyMuPDF>=1.26.7,<1.29
+reportlab>=4.0
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=1.0
+pywin32>=306; platform_system == "Windows"
+tkinterdnd2==0.6.2
+wordninja==2.0.0
