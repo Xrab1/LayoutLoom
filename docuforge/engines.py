@@ -193,8 +193,8 @@ def pdf_to_word_capability() -> Capability:
         )
     return Capability(
         "ready",
-        "混合保真、全文可编辑与整篇高清原样三种模式均已就绪",
-        "pdf2docx + PyMuPDF + python-docx",
+        "版式优先混合、全文可编辑重建与整篇高清原样已就绪；Microsoft Word 原生转换需桌面版 Word",
+        "pdf2docx + PyMuPDF + python-docx；原生转换另需 Microsoft Word",
     )
 
 

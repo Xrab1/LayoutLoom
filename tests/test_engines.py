@@ -222,7 +222,7 @@ class EngineCapabilityTests(unittest.TestCase):
         self.assertIn("pdf2docx", capability.reason)
         self.assertIn("pymupdf", capability.reason)
 
-    def test_pdf_to_word_exposes_three_local_modes(self) -> None:
+    def test_pdf_to_word_exposes_builtin_modes_and_optional_word_reflow(self) -> None:
         with patch.object(
             engines,
             "has_module",
@@ -231,8 +231,9 @@ class EngineCapabilityTests(unittest.TestCase):
             capability = engines.pdf_to_word_capability()
         self.assertTrue(capability.runnable)
         self.assertEqual(capability.status, "ready")
-        self.assertIn("三种模式", capability.reason)
-        self.assertIn("混合保真", capability.reason)
+        self.assertIn("版式优先混合", capability.reason)
+        self.assertIn("Microsoft Word 原生转换", capability.reason)
+        self.assertIn("桌面版 Word", capability.reason)
         self.assertIn("pdf2docx", capability.engine)
 
 

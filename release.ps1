@@ -23,6 +23,181 @@ function Remove-WorkspaceChild {
     Remove-Item -LiteralPath $target -Recurse -Force
 }
 
+function Stop-FrozenProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    try {
+        if ($Process.HasExited) {
+            return
+        }
+        $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+            & $taskkill /PID $Process.Id /T /F *> $null
+        } else {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    } finally {
+        try {
+            $Process.WaitForExit(5000) | Out-Null
+        } catch {
+        }
+    }
+}
+
+function Invoke-FrozenSelfTest {
+    param(
+        [string]$Executable,
+        [string]$Description,
+        [int]$TimeoutMilliseconds = 60000,
+        [hashtable]$EnvironmentOverrides = @{}
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = "--self-test"
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    foreach ($entry in $EnvironmentOverrides.GetEnumerator()) {
+        $startInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
+    }
+    $selfTestErrorFile = $null
+    if ($EnvironmentOverrides.ContainsKey("LOCALAPPDATA")) {
+        $selfTestErrorFile = Join-Path ([string]$EnvironmentOverrides["LOCALAPPDATA"]) "layoutloom-self-test-error.log"
+        if (Test-Path -LiteralPath $selfTestErrorFile -PathType Leaf) {
+            Remove-Item -LiteralPath $selfTestErrorFile -Force
+        }
+        $startInfo.EnvironmentVariables["LAYOUTLOOM_SELF_TEST_ERROR_FILE"] = $selfTestErrorFile
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "$Description could not be started."
+        }
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            Stop-FrozenProcessTree -Process $process
+            $timeoutSeconds = [math]::Ceiling($TimeoutMilliseconds / 1000)
+            throw "$Description did not finish within $timeoutSeconds seconds."
+        }
+        $process.Refresh()
+        if ($process.ExitCode -ne 0) {
+            $diagnostic = ""
+            if ($selfTestErrorFile -and (Test-Path -LiteralPath $selfTestErrorFile -PathType Leaf)) {
+                $diagnosticText = (Get-Content -Raw -LiteralPath $selfTestErrorFile).Trim()
+                if ($diagnosticText) {
+                    $diagnostic = "`n$diagnosticText"
+                }
+            }
+            throw "$Description failed with exit code $($process.ExitCode).$diagnostic"
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Assert-PortableArchiveRuntime {
+    param([string]$ArchivePath)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $entries = @{}
+        foreach ($entry in $archive.Entries) {
+            $entries[$entry.FullName.Replace('\', '/')] = $entry
+        }
+        $requiredEntries = @(
+            "LayoutLoom/_internal/_tcl_data/init.tcl",
+            "LayoutLoom/_internal/_tk_data/tk.tcl",
+            "LayoutLoom/_internal/_tkinter.pyd",
+            "LayoutLoom/_internal/tcl86t.dll",
+            "LayoutLoom/_internal/tk86t.dll",
+            "LayoutLoom/_internal/tk_runtime_backup.zip"
+        )
+        foreach ($requiredEntry in $requiredEntries) {
+            if (-not $entries.ContainsKey($requiredEntry)) {
+                throw "The portable archive is missing required runtime entry: $requiredEntry"
+            }
+        }
+        $backupEntry = $entries["LayoutLoom/_internal/tk_runtime_backup.zip"]
+        $memory = New-Object System.IO.MemoryStream
+        $backupStream = $backupEntry.Open()
+        try {
+            $backupStream.CopyTo($memory)
+        } finally {
+            $backupStream.Dispose()
+        }
+        $memory.Position = 0
+        $backupArchive = [System.IO.Compression.ZipArchive]::new(
+            $memory,
+            [System.IO.Compression.ZipArchiveMode]::Read,
+            $false
+        )
+        try {
+            $backupNames = @($backupArchive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            foreach ($requiredBackup in @("_tcl_data/init.tcl", "_tk_data/tk.tcl")) {
+                if ($requiredBackup -notin $backupNames) {
+                    throw "The Tcl/Tk recovery archive is missing: $requiredBackup"
+                }
+            }
+        } finally {
+            $backupArchive.Dispose()
+            $memory.Dispose()
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Test-ExtractedPortableRuntime {
+    param(
+        [string]$ArchivePath,
+        [string]$ValidationDirectory,
+        [string]$ExpectedParent
+    )
+    Remove-WorkspaceChild -Path $ValidationDirectory -ExpectedParent $ExpectedParent
+    New-Item -ItemType Directory -Path $ValidationDirectory | Out-Null
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ValidationDirectory -Force
+    $bundle = Join-Path $ValidationDirectory "LayoutLoom"
+    $executable = Join-Path $bundle "LayoutLoom.exe"
+    $internal = Join-Path $bundle "_internal"
+    $primaryTcl = Join-Path $internal "_tcl_data"
+    $primaryTk = Join-Path $internal "_tk_data"
+    $heldTcl = Join-Path $internal "_tcl_data.primary-validation"
+    $heldTk = Join-Path $internal "_tk_data.primary-validation"
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+        throw "The extracted portable archive does not contain LayoutLoom.exe."
+    }
+    $savedTkEnvironment = @{}
+    foreach ($name in @("TCL_LIBRARY", "TK_LIBRARY", "LOCALAPPDATA")) {
+        $savedTkEnvironment[$name] = [System.Environment]::GetEnvironmentVariable($name, "Process")
+    }
+    [System.Environment]::SetEnvironmentVariable("TCL_LIBRARY", $null, "Process")
+    [System.Environment]::SetEnvironmentVariable("TK_LIBRARY", $null, "Process")
+    $primaryLocalAppData = Join-Path $ValidationDirectory "primary-local-app-data"
+    $recoveryLocalAppData = Join-Path $ValidationDirectory "recovery-local-app-data"
+    foreach ($isolatedLocalAppData in @($primaryLocalAppData, $recoveryLocalAppData)) {
+        New-Item -ItemType Directory -Path $isolatedLocalAppData -Force | Out-Null
+    }
+    [System.Environment]::SetEnvironmentVariable("LOCALAPPDATA", $primaryLocalAppData, "Process")
+    try {
+        Invoke-FrozenSelfTest -Executable $executable -Description "The extracted portable self-test" -EnvironmentOverrides @{ LOCALAPPDATA = $primaryLocalAppData }
+        Move-Item -LiteralPath $primaryTcl -Destination $heldTcl
+        Move-Item -LiteralPath $primaryTk -Destination $heldTk
+        Invoke-FrozenSelfTest -Executable $executable -Description "The extracted Tcl/Tk recovery self-test" -TimeoutMilliseconds 180000 -EnvironmentOverrides @{ LOCALAPPDATA = $recoveryLocalAppData }
+    } finally {
+        if ((Test-Path -LiteralPath $heldTcl) -and -not (Test-Path -LiteralPath $primaryTcl)) {
+            Move-Item -LiteralPath $heldTcl -Destination $primaryTcl
+        }
+        if ((Test-Path -LiteralPath $heldTk) -and -not (Test-Path -LiteralPath $primaryTk)) {
+            Move-Item -LiteralPath $heldTk -Destination $primaryTk
+        }
+        foreach ($name in @("TCL_LIBRARY", "TK_LIBRARY", "LOCALAPPDATA")) {
+            [System.Environment]::SetEnvironmentVariable($name, $savedTkEnvironment[$name], "Process")
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
     throw "Project virtual environment is missing. Run install.ps1 first."
 }
@@ -49,7 +224,7 @@ New-Item -ItemType Directory -Path $stageRoot | Out-Null
 
 $sourceStage = Join-Path $stageRoot "LayoutLoom-Source-$version"
 New-Item -ItemType Directory -Path $sourceStage | Out-Null
-$sourceDirectories = @("docuforge", "tests")
+$sourceDirectories = @("docuforge", "tests", "packaging_hooks")
 foreach ($name in $sourceDirectories) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $sourceStage -Recurse -Force
 }
@@ -124,6 +299,12 @@ if (-not $SkipPortableArchive) {
     throw "SkipPortableArchive was requested, but the portable archive does not exist: $portableZip"
 }
 Compress-Archive -LiteralPath $sourceStage -DestinationPath $sourceZip -CompressionLevel Optimal
+
+Assert-PortableArchiveRuntime -ArchivePath $portableZip
+$portableValidation = Join-Path $stageRoot "portable-runtime-validation"
+Test-ExtractedPortableRuntime -ArchivePath $portableZip -ValidationDirectory $portableValidation -ExpectedParent $stageRoot
+Remove-WorkspaceChild -Path $portableValidation -ExpectedParent $stageRoot
+Write-Host "Portable archive Tcl/Tk integrity and recovery self-tests passed."
 
 $hashLines = foreach ($archive in @($portableZip, $sourceZip)) {
     $hash = Get-FileHash -LiteralPath $archive -Algorithm SHA256

@@ -18,7 +18,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen.canvas import Canvas
 
-from docuforge.models import ValidationError
+from docuforge.models import MissingEngineError, ValidationError
 from docuforge.processors import conversion as conversion_processor
 from docuforge.processors.conversion import (
     _adjacent_english_word_coverage,
@@ -234,6 +234,65 @@ class ConversionProcessorTests(unittest.TestCase):
             self.assertEqual(len(next_page_breaks), 2)
             self.assertEqual(default_height_empty_breaks, [])
 
+    def test_office_native_routes_directly_to_word_reflow(self) -> None:
+        quality = conversion_processor._PdfWordCandidateQuality(
+            0.99, 0.99, 0.99, (), None, None, 0, 12, 0, True
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = self._make_pdf(root / "paper.pdf")
+            output = root / "office-native.docx"
+
+            def build_office(
+                _source: Path, candidate: Path, **_kwargs: object
+            ) -> object:
+                document = Document()
+                document.add_paragraph("Microsoft Word native PDF Reflow.")
+                document.save(candidate)
+                return quality
+
+            with patch.object(
+                conversion_processor,
+                "_convert_pdf_with_microsoft_reflow_candidate",
+                side_effect=build_office,
+            ) as office_converter:
+                self.assertEqual(
+                    pdf_to_docx(source, output, mode="office_native"),
+                    [output],
+                )
+
+            office_converter.assert_called_once()
+            self.assertIn("native PDF Reflow", _extract_docx_text(output))
+
+    def test_editable_mode_keeps_the_builtin_reconstruction_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = self._make_pdf(root / "paper.pdf")
+            output = root / "editable.docx"
+
+            def build_builtin(
+                _source: Path, target: Path, **_kwargs: object
+            ) -> None:
+                document = Document()
+                document.add_paragraph("LayoutLoom editable reconstruction.")
+                document.save(target)
+
+            with patch.object(
+                conversion_processor,
+                "_execute_layoutloom_pdf_to_docx",
+                side_effect=build_builtin,
+            ) as builtin_converter, patch.object(
+                conversion_processor,
+                "_convert_pdf_with_microsoft_reflow_candidate",
+            ) as office_converter:
+                self.assertEqual(
+                    pdf_to_docx(source, output, mode="editable"),
+                    [output],
+                )
+
+            builtin_converter.assert_called_once()
+            office_converter.assert_not_called()
+            self.assertIn("LayoutLoom editable", _extract_docx_text(output))
     def test_hybrid_pdf_to_docx_rasterizes_a_scan_while_editable_rejects_it(
         self,
     ) -> None:
@@ -6156,9 +6215,114 @@ class ConversionProcessorTests(unittest.TestCase):
             root = Path(folder)
             source = self._make_pdf(root / "合同.pdf")
             with self.assertRaisesRegex(
-                ValidationError, "editable.*hybrid.*visual"
+                ValidationError, "editable.*hybrid.*office_native.*visual"
             ):
                 pdf_to_docx(source, root / "合同.docx", mode="unknown")
+
+    def test_pdf_to_docx_rejects_an_unknown_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = self._make_pdf(root / "合同.pdf")
+            output = root / "合同.docx"
+            with self.assertRaisesRegex(
+                ValidationError, "auto.*layoutloom.*microsoft_office"
+            ):
+                pdf_to_docx(source, output, engine="imaginary")
+            self.assertFalse(output.exists())
+
+    def test_pdf_to_docx_rejects_forced_office_in_legacy_hybrid_mode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = self._make_pdf(root / "合同.pdf")
+            output = root / "hybrid.docx"
+            with self.assertRaisesRegex(ValidationError, "Microsoft Word 原生转换"):
+                pdf_to_docx(
+                    source,
+                    output,
+                    mode="hybrid",
+                    engine="microsoft_office",
+                )
+            self.assertFalse(output.exists())
+
+    def test_pdf_to_docx_office_native_rejects_layoutloom_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = self._make_pdf(root / "论文.pdf")
+            output = root / "Office原生.docx"
+            with self.assertRaisesRegex(ValidationError, "必须调用桌面版 Microsoft Word"):
+                pdf_to_docx(
+                    source,
+                    output,
+                    mode="office_native",
+                    engine="layoutloom",
+                )
+            self.assertFalse(output.exists())
+
+    def test_office_native_reports_missing_microsoft_word_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "docuforge.processors.office.detect_office_engines",
+            return_value={
+                "microsoft_word": SimpleNamespace(
+                    available=False,
+                    reason="未检测到桌面版 Microsoft Word",
+                )
+            },
+        ):
+            root = Path(folder)
+            source = root / "论文.pdf"
+            source.touch()
+            with self.assertRaisesRegex(MissingEngineError, "未检测到桌面版 Microsoft Word"):
+                conversion_processor._convert_pdf_with_microsoft_reflow_candidate(
+                    source,
+                    root / "论文.docx",
+                    password=None,
+                    expected_pages=1,
+                    low_quality_policy="discard",
+                    progress_start=0.0,
+                    progress_span=1.0,
+                )
+
+    def test_forced_office_keep_policy_does_not_claim_failed_quality_passed(
+        self,
+    ) -> None:
+        failed_quality = conversion_processor._PdfWordCandidateQuality(
+            0.40, 0.35, 0.20, (), None, None, 0, 10, 0, False
+        )
+
+        def build_office(
+            _source: Path, candidate: Path, **_kwargs: object
+        ) -> object:
+            candidate.write_bytes(b"office")
+            return failed_quality
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            conversion_processor,
+            "_inspect_pdf_text_layers",
+            return_value=(["source text"], []),
+        ), patch.object(
+            conversion_processor,
+            "_convert_pdf_with_microsoft_reflow_candidate",
+            side_effect=build_office,
+        ):
+            root = Path(folder)
+            source = root / "source.pdf"
+            source.write_bytes(b"pdf")
+            target = root / "target.docx"
+            with self.assertWarnsRegex(UserWarning, "未完全通过"):
+                conversion_processor._execute_pdf_to_docx(
+                    source,
+                    target,
+                    password=None,
+                    mode="office_native",
+                    dpi=300,
+                    low_quality_policy="keep",
+                    hybrid_force_visual_pages="",
+                    column_layout="auto",
+                    engine="microsoft_office",
+                )
+            self.assertEqual(target.read_bytes(), b"office")
 
     def test_pdf_to_docx_rejects_an_unknown_column_layout(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

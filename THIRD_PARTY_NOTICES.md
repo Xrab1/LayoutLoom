@@ -17,6 +17,6 @@
 | Real-ESRGAN NCNN Python binding | 可选 GPU 图像增强 | BSD-3-Clause；模型和底层 NCNN/Vulkan 组件按各自许可证发布 |
 | pywin32 | Windows COM 桥接 | PSF |
 
-WPS Office、Microsoft Office 和 LibreOffice 不属于页织工坊发布包，也不会被复制或重新分发。软件只检测和调用用户电脑上已有的合法安装；LibreOffice 仍可作为用户自行安装的第三顺位 Office 转换引擎。
+WPS Office、Microsoft Office 和 LibreOffice 不属于页织工坊发布包，也不会被复制或重新分发。软件只检测和调用用户电脑上已有的合法安装；WPS 与 Microsoft Office 均使用各自的真实 COM 自动化接口并接受独立适配，LibreOffice 可作为用户自行安装的第三顺位兼容转换引擎。
 
 `build.ps1` 会把虚拟环境中各 Python 包的 `LICENSE`、`COPYING`、`NOTICE` 等原始文件自动汇入 `dist/LayoutLoom/THIRD_PARTY_LICENSES/Python-packages`。发布维护者仍应在每次升级依赖后重新核对许可证清单、二进制来源、源代码链接和实际构建选项。

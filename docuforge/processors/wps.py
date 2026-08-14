@@ -291,6 +291,8 @@ def convert_with_wps(
     application = None
     document = None
     initialized = False
+    application_owned = True
+    original_application_settings: dict[str, object] = {}
     owned_process = None
     process_helpers = None
     expected_process = {
@@ -303,6 +305,7 @@ def convert_with_wps(
     try:
         from .office import (
             _office_application_pid,
+            _new_owned_office_process,
             _wait_for_owned_office_exit,
             _windows_process_identity,
             _windows_process_snapshot,
@@ -312,27 +315,99 @@ def convert_with_wps(
             _office_application_pid,
             _wait_for_owned_office_exit,
             _windows_process_identity,
+            _new_owned_office_process,
         )
         before_processes = dict(_windows_process_snapshot(expected_process))
     except Exception:
         process_helpers = None
+
+    def release_application() -> None:
+        nonlocal application
+        if application is None:
+            return
+        if application_owned:
+            try:
+                application.Quit()
+            except Exception:
+                pass
+        else:
+            for property_name, original_value in original_application_settings.items():
+                try:
+                    setattr(application, property_name, original_value)
+                except Exception:
+                    pass
+        application = None
+
     try:
         pythoncom.CoInitialize()  # type: ignore[attr-defined]
         initialized = True
         application = win32_client.DispatchEx(status.prog_id)  # type: ignore[attr-defined]
+        ownership_required = process_helpers is not None and status.executable is not None
+        application_owned = not ownership_required
         if process_helpers is not None:
             application_pid = process_helpers[0](application)
-            identity = (
-                process_helpers[2](application_pid)
-                if application_pid is not None
-                else None
-            )
-            if (
-                identity is not None
-                and identity.pid not in before_processes
-                and identity.executable.name.casefold() == expected_process.casefold()
-            ):
+            if ownership_required:
+                identity = process_helpers[3](
+                    before_processes,
+                    expected_executable=status.executable,
+                    reported_pid=application_pid,
+                )
+            else:
+                identity = (
+                    process_helpers[2](application_pid)
+                    if application_pid is not None
+                    else None
+                )
+                if not (
+                    identity is not None
+                    and identity.pid not in before_processes
+                    and identity.executable.name.casefold()
+                    == expected_process.casefold()
+                ):
+                    identity = None
+            if ownership_required and identity is None:
+                existing_identity = (
+                    process_helpers[2](application_pid)
+                    if application_pid is not None
+                    else None
+                )
+                expected_path = status.executable.expanduser().resolve()
+                path_confirmed = bool(
+                    existing_identity is not None
+                    and existing_identity.executable == expected_path
+                )
+                if not path_confirmed:
+                    try:
+                        application_executable = (
+                            Path(str(application.Path)).expanduser().resolve()
+                            / expected_process
+                        ).resolve()
+                    except Exception:
+                        application_executable = None
+                    path_confirmed = application_executable == expected_path
+                collection_name = {
+                    "writer": "Documents",
+                    "spreadsheets": "Workbooks",
+                    "presentation": "Presentations",
+                }[kind]
+                try:
+                    open_documents = int(
+                        getattr(application, collection_name).Count
+                    )
+                except Exception:
+                    open_documents = -1
+                if (
+                    not path_confirmed
+                    or open_documents != 0
+                ):
+                    raise MissingEngineError(
+                        "WPS 复用了已有实例，且无法确认该实例处于无文档空闲状态；"
+                        "为保护用户已打开的文档，已停止自动化"
+                    )
+                application_owned = False
+            if identity is not None:
                 owned_process = identity
+                application_owned = True
                 try:
                     from .office import _terminate_owned_office_process
 
@@ -344,6 +419,21 @@ def convert_with_wps(
                     cancel_process_guard.__enter__()
                 except Exception:
                     cancel_process_guard = None
+        if not application_owned:
+            for property_name in (
+                "AutomationSecurity",
+                "Visible",
+                "DisplayAlerts",
+                "ScreenUpdating",
+                "EnableEvents",
+                "AskToUpdateLinks",
+            ):
+                try:
+                    original_application_settings[property_name] = getattr(
+                        application, property_name
+                    )
+                except Exception:
+                    pass
         _disable_automation_macros(application, kind)
         try:
             application.Visible = False
@@ -365,7 +455,15 @@ def convert_with_wps(
         with atomic_output(target) as temporary:
             temporary.unlink(missing_ok=True)
             if kind == "writer":
-                document = application.Documents.Open(str(source_path), ReadOnly=True)
+                document = application.Documents.Open(
+                    str(source_path),
+                    ConfirmConversions=False,
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    Revert=False,
+                    Visible=False,
+                    NoEncodingDialog=True,
+                )
                 _writer_convert(document, temporary, format_name)
             elif kind == "spreadsheets":
                 document = application.Workbooks.Open(
@@ -400,9 +498,7 @@ def convert_with_wps(
                 else:
                     document.Close(False)
                 document = None
-            if application is not None:
-                application.Quit()
-                application = None
+            release_application()
             if initialized:
                 pythoncom.CoUninitialize()  # type: ignore[attr-defined]
                 initialized = False
@@ -426,11 +522,7 @@ def convert_with_wps(
                 document.Close(False)
             except Exception:
                 pass
-        if application is not None:
-            try:
-                application.Quit()
-            except Exception:
-                pass
+        release_application()
         if initialized:
             pythoncom.CoUninitialize()  # type: ignore[attr-defined]
         if owned_process is not None and process_helpers is not None:

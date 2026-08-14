@@ -16,6 +16,28 @@ function Assert-NativeSuccess {
     }
 }
 
+function Stop-FrozenProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    try {
+        if ($Process.HasExited) {
+            return
+        }
+        $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+            & $taskkill /PID $Process.Id /T /F *> $null
+        } else {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    } finally {
+        try {
+            $Process.WaitForExit(5000) | Out-Null
+        } catch {
+        }
+    }
+}
+
 function Test-PythonInterpreter {
     param([string]$Executable)
     if (-not (Test-Path -LiteralPath $Executable)) {
@@ -36,6 +58,107 @@ function Test-PythonModule {
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
+    }
+}
+
+function New-TkRuntimeBackup {
+    param(
+        [string]$TclDirectory,
+        [string]$TkDirectory,
+        [string]$Destination
+    )
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $destinationParent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        Remove-Item -LiteralPath $Destination -Force
+    }
+    $stream = [System.IO.File]::Open(
+        $Destination,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+    $archive = [System.IO.Compression.ZipArchive]::new(
+        $stream,
+        [System.IO.Compression.ZipArchiveMode]::Create,
+        $false
+    )
+    try {
+        foreach ($mapping in @(
+            [PSCustomObject]@{ Source = $TclDirectory; Root = "_tcl_data" },
+            [PSCustomObject]@{ Source = $TkDirectory; Root = "_tk_data" }
+        )) {
+            $sourcePrefix = [System.IO.Path]::GetFullPath($mapping.Source).TrimEnd('\') + '\'
+            foreach ($file in Get-ChildItem -LiteralPath $mapping.Source -Recurse -File) {
+                if (-not $file.FullName.StartsWith($sourcePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Unexpected Tcl/Tk runtime path: $($file.FullName)"
+                }
+                $relative = $file.FullName.Substring($sourcePrefix.Length).Replace('\', '/')
+                $entryName = "$($mapping.Root)/$relative"
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $archive,
+                    $file.FullName,
+                    $entryName,
+                    [System.IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+            }
+        }
+    } finally {
+        $archive.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Invoke-FrozenSelfTest {
+    param(
+        [string]$Executable,
+        [string]$Description,
+        [int]$TimeoutMilliseconds = 60000,
+        [hashtable]$EnvironmentOverrides = @{}
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = "--self-test"
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    foreach ($entry in $EnvironmentOverrides.GetEnumerator()) {
+        $startInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
+    }
+    $selfTestErrorFile = $null
+    if ($EnvironmentOverrides.ContainsKey("LOCALAPPDATA")) {
+        $selfTestErrorFile = Join-Path ([string]$EnvironmentOverrides["LOCALAPPDATA"]) "layoutloom-self-test-error.log"
+        if (Test-Path -LiteralPath $selfTestErrorFile -PathType Leaf) {
+            Remove-Item -LiteralPath $selfTestErrorFile -Force
+        }
+        $startInfo.EnvironmentVariables["LAYOUTLOOM_SELF_TEST_ERROR_FILE"] = $selfTestErrorFile
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "$Description could not be started."
+        }
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            Stop-FrozenProcessTree -Process $process
+            $timeoutSeconds = [math]::Ceiling($TimeoutMilliseconds / 1000)
+            throw "$Description did not finish within $timeoutSeconds seconds."
+        }
+        $process.Refresh()
+        if ($process.ExitCode -ne 0) {
+            $diagnostic = ""
+            if ($selfTestErrorFile -and (Test-Path -LiteralPath $selfTestErrorFile -PathType Leaf)) {
+                $diagnosticText = (Get-Content -Raw -LiteralPath $selfTestErrorFile).Trim()
+                if ($diagnosticText) {
+                    $diagnostic = "`n$diagnosticText"
+                }
+            }
+            throw "$Description failed with exit code $($process.ExitCode).$diagnostic"
+        }
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -89,12 +212,31 @@ try {
     & $pythonExe -m pip install "pyinstaller>=6.0"
     Assert-NativeSuccess "Failed to install PyInstaller"
 
+    $tkRuntimeJson = (& $pythonExe -c "import json, pathlib, tkinter; tcl = pathlib.Path(tkinter.Tcl().eval('info library')).resolve(); tk = tcl.parent / ('tk' + str(tkinter.TkVersion)); print(json.dumps({'tcl': str(tcl), 'tk': str(tk)}))").Trim()
+    Assert-NativeSuccess "Failed to locate the Python Tcl/Tk runtime"
+    $tkRuntime = $tkRuntimeJson | ConvertFrom-Json
+    foreach ($requiredTkFile in @(
+        (Join-Path $tkRuntime.tcl "init.tcl"),
+        (Join-Path $tkRuntime.tk "tk.tcl")
+    )) {
+        if (-not (Test-Path -LiteralPath $requiredTkFile -PathType Leaf)) {
+            throw "The Python Tcl/Tk runtime is incomplete: $requiredTkFile"
+        }
+    }
+    $tkBackupArchive = Join-Path $projectRoot "build\tk_runtime_backup.zip"
+    New-TkRuntimeBackup -TclDirectory $tkRuntime.tcl -TkDirectory $tkRuntime.tk -Destination $tkBackupArchive
+    if (-not (Test-Path -LiteralPath $tkBackupArchive -PathType Leaf)) {
+        throw "Failed to create the Tcl/Tk recovery archive."
+    }
+
     $buildArgs = @(
         "--noconfirm",
         "--clean",
         "--windowed",
         "--onedir",
         "--name", "LayoutLoom",
+        "--additional-hooks-dir", (Join-Path $projectRoot "packaging_hooks"),
+        "--add-data", ("{0};." -f $tkBackupArchive),
         "--collect-all", "PIL",
         "--collect-all", "cv2",
         "--collect-all", "numpy",
@@ -166,6 +308,19 @@ try {
     if (-not (Test-Path -LiteralPath $bundleDirectory -PathType Container)) {
         throw "The one-folder bundle directory is missing: '$bundleDirectory'."
     }
+    $bundleInternal = Join-Path $bundleDirectory "_internal"
+    foreach ($requiredTkRuntimeFile in @(
+        (Join-Path $bundleInternal "_tcl_data\init.tcl"),
+        (Join-Path $bundleInternal "_tk_data\tk.tcl"),
+        (Join-Path $bundleInternal "_tkinter.pyd"),
+        (Join-Path $bundleInternal "tcl86t.dll"),
+        (Join-Path $bundleInternal "tk86t.dll"),
+        (Join-Path $bundleInternal "tk_runtime_backup.zip")
+    )) {
+        if (-not (Test-Path -LiteralPath $requiredTkRuntimeFile -PathType Leaf)) {
+            throw "The packaged Tcl/Tk runtime is incomplete: $requiredTkRuntimeFile"
+        }
+    }
 
     $bundleFfmpeg = Join-Path $bundleDirectory "ffmpeg"
     $bundlePoppler = Join-Path $bundleDirectory "poppler"
@@ -228,19 +383,48 @@ try {
         }
     }
 
-    $smokeProcess = Start-Process -FilePath $exePath -ArgumentList "--self-test" -PassThru -WindowStyle Hidden
-    if (-not $smokeProcess.WaitForExit(60000)) {
-        try {
-            Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
-        } catch {
+    $savedTkEnvironment = @{}
+    foreach ($name in @("TCL_LIBRARY", "TK_LIBRARY", "LOCALAPPDATA")) {
+        $savedTkEnvironment[$name] = [System.Environment]::GetEnvironmentVariable($name, "Process")
+    }
+    [System.Environment]::SetEnvironmentVariable("TCL_LIBRARY", $null, "Process")
+    [System.Environment]::SetEnvironmentVariable("TK_LIBRARY", $null, "Process")
+    # Give the two independent gates separate cache roots so diagnostic and
+    # recovery state from one frozen launch cannot affect the other.
+    $primarySelfTestLocalAppData = Join-Path $projectRoot ("build\tk-primary-self-test-" + [guid]::NewGuid().ToString("N"))
+    $recoverySelfTestLocalAppData = Join-Path $projectRoot ("build\tk-recovery-self-test-" + [guid]::NewGuid().ToString("N"))
+    foreach ($selfTestLocalAppData in @($primarySelfTestLocalAppData, $recoverySelfTestLocalAppData)) {
+        New-Item -ItemType Directory -Path $selfTestLocalAppData -Force | Out-Null
+    }
+    [System.Environment]::SetEnvironmentVariable("LOCALAPPDATA", $primarySelfTestLocalAppData, "Process")
+    $primaryTcl = Join-Path $bundleInternal "_tcl_data"
+    $primaryTk = Join-Path $bundleInternal "_tk_data"
+    $heldTcl = Join-Path $bundleInternal "_tcl_data.primary-validation"
+    $heldTk = Join-Path $bundleInternal "_tk_data.primary-validation"
+    try {
+        Invoke-FrozenSelfTest -Executable $exePath -Description "The generated executable self-test" -EnvironmentOverrides @{ LOCALAPPDATA = $primarySelfTestLocalAppData }
+        Move-Item -LiteralPath $primaryTcl -Destination $heldTcl
+        Move-Item -LiteralPath $primaryTk -Destination $heldTk
+        Invoke-FrozenSelfTest -Executable $exePath -Description "The Tcl/Tk recovery self-test" -TimeoutMilliseconds 180000 -EnvironmentOverrides @{ LOCALAPPDATA = $recoverySelfTestLocalAppData }
+    } finally {
+        if ((Test-Path -LiteralPath $heldTcl) -and -not (Test-Path -LiteralPath $primaryTcl)) {
+            Move-Item -LiteralPath $heldTcl -Destination $primaryTcl
         }
-        throw "The generated executable did not finish its self-test within 60 seconds."
+        if ((Test-Path -LiteralPath $heldTk) -and -not (Test-Path -LiteralPath $primaryTk)) {
+            Move-Item -LiteralPath $heldTk -Destination $primaryTk
+        }
+        foreach ($name in @("TCL_LIBRARY", "TK_LIBRARY", "LOCALAPPDATA")) {
+            [System.Environment]::SetEnvironmentVariable($name, $savedTkEnvironment[$name], "Process")
+        }
+        $buildRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "build")).TrimEnd('\') + '\'
+        foreach ($selfTestLocalAppData in @($primarySelfTestLocalAppData, $recoverySelfTestLocalAppData)) {
+            $cachePath = [System.IO.Path]::GetFullPath($selfTestLocalAppData)
+            if ($cachePath.StartsWith($buildRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $cachePath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
-    $smokeProcess.Refresh()
-    if ($smokeProcess.ExitCode -ne 0) {
-        throw "The generated executable failed its self-test with exit code $($smokeProcess.ExitCode)."
-    }
-    Write-Host "Executable self-test passed."
+    Write-Host "Executable and Tcl/Tk recovery self-tests passed."
 } finally {
     Pop-Location
 }

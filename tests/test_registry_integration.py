@@ -172,7 +172,7 @@ class RegistryIntegrationTests(unittest.TestCase):
         word_engine = self.operations["word.to_pdf"].parameters[0]
         choices = dict(word_engine.choices)
         self.assertIn("WPS → Microsoft Office → LibreOffice", choices["auto"])
-        self.assertIn("仅显式选择", choices["microsoft_office"])
+        self.assertIn("已定向适配", choices["microsoft_office"])
         self.assertIn("不会偷换", self.operations["word.to_pdf"].notes)
 
         excel_engine = self.operations["excel.to_pdf"].parameters[0]
@@ -548,9 +548,15 @@ class RegistryIntegrationTests(unittest.TestCase):
             {
                 "hybrid": "版式优先混合（推荐）",
                 "editable": "全文可编辑重建",
+                "office_native": "Microsoft Word 原生转换",
                 "visual": "整篇高清原样（不可编辑）",
             },
         )
+        self.assertIn("保留原有内置重建方案", mode.help_text)
+        self.assertIn("直接调用桌面版 Word", mode.help_text)
+        self.assertIn("不与内置方案混合", mode.help_text)
+        self.assertIn("未安装桌面版 Word 时会明确失败", mode.help_text)
+
         column_layout = operation.parameters[1]
         self.assertEqual(column_layout.default, "auto")
         self.assertEqual(
@@ -564,9 +570,17 @@ class RegistryIntegrationTests(unittest.TestCase):
         )
         self.assertIn("阅读顺序", column_layout.help_text)
         self.assertIn("标题、摘要为单栏而正文为双栏", column_layout.help_text)
+        self.assertEqual(
+            column_layout.visible_when,
+            ("mode", ("hybrid", "editable")),
+        )
+
         force_visual_pages = operation.parameters[2]
         self.assertEqual(force_visual_pages.default, "")
+        self.assertIn("仅版式优先混合模式生效", force_visual_pages.help_text)
         self.assertIn("1,3-5", force_visual_pages.help_text)
+        self.assertEqual(force_visual_pages.visible_when, ("mode", ("hybrid",)))
+
         low_quality_policy = operation.parameters[3]
         self.assertEqual(low_quality_policy.default, "discard")
         self.assertEqual(
@@ -576,10 +590,12 @@ class RegistryIntegrationTests(unittest.TestCase):
                 "keep": "仍保留并警告",
             },
         )
-        self.assertIn("版式优先混合模式生效", low_quality_policy.help_text)
+        self.assertIn("Microsoft Word 原生转换生效", low_quality_policy.help_text)
         self.assertIn("WPS 实际分页", low_quality_policy.help_text)
         self.assertIn("仍保留时", low_quality_policy.help_text)
         self.assertIn("可靠页面保持可编辑", operation.notes)
+        self.assertIn("不会自动切换到 Office 候选", operation.notes)
+        self.assertIn("不会在失败时回退到其他模式", operation.notes)
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -593,10 +609,40 @@ class RegistryIntegrationTests(unittest.TestCase):
                 selected_policy,
                 forced_pages,
                 filename_part,
+                expected_engine,
             ) in (
-                ("hybrid", "double", "discard", "1,3-5", "混合保真Word"),
-                ("editable", "single", "keep", "", "可编辑Word"),
-                ("visual", "mixed", "discard", "", "高清原样Word"),
+                (
+                    "hybrid",
+                    "double",
+                    "discard",
+                    "1,3-5",
+                    "混合保真Word",
+                    "layoutloom",
+                ),
+                (
+                    "editable",
+                    "single",
+                    "keep",
+                    "",
+                    "可编辑Word",
+                    "layoutloom",
+                ),
+                (
+                    "office_native",
+                    "auto",
+                    "keep",
+                    "",
+                    "Office原生Word",
+                    "microsoft_office",
+                ),
+                (
+                    "visual",
+                    "mixed",
+                    "discard",
+                    "",
+                    "高清原样Word",
+                    "layoutloom",
+                ),
             ):
                 with self.subTest(
                     mode=selected_mode,
@@ -622,6 +668,9 @@ class RegistryIntegrationTests(unittest.TestCase):
                     self.assertIn(filename_part, outputs[0].name)
                     self.assertEqual(convert.call_args.kwargs["mode"], selected_mode)
                     self.assertEqual(
+                        convert.call_args.kwargs["engine"], expected_engine
+                    )
+                    self.assertEqual(
                         convert.call_args.kwargs["column_layout"],
                         selected_layout,
                     )
@@ -646,7 +695,7 @@ class RegistryIntegrationTests(unittest.TestCase):
                 }
             )
             self.assertEqual(legacy_params["column_layout"], "auto")
-
+            self.assertNotIn("engine", legacy_params)
     def test_pdf_insert_pages_uses_a_new_name_on_repeat(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

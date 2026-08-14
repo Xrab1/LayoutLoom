@@ -199,6 +199,36 @@ class _PdfWordLayoutProfile:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _PdfWordCandidateQuality:
+    sequence_coverage: float
+    english_word_recall: float
+    adjacent_word_coverage: float
+    layout_reasons: tuple[str, ...]
+    pagination_reason: str | None
+    pagination_warning: str | None
+    positioned_nodes: int
+    paragraphs: int
+    tables: int
+    text_passed: bool
+
+    @property
+    def score(self) -> float:
+        return (
+            self.sequence_coverage * 0.50
+            + self.english_word_recall * 0.30
+            + self.adjacent_word_coverage * 0.20
+        )
+
+    @property
+    def passed(self) -> bool:
+        return bool(
+            self.text_passed
+            and not self.layout_reasons
+            and self.pagination_reason is None
+        )
+
+
 _TEMPORARY_DIRECTORY_CLEANUP_DELAYS = (0.0, 0.05, 0.15, 0.35)
 
 
@@ -4465,6 +4495,7 @@ def _pdf2docx_wps_render_quality_result(
     expected_pages: int,
     password: str | None,
     progress: Callable[[float, str], None] | None = None,
+    force: bool = False,
 ) -> tuple[str | None, str | None]:
     """Render a longer final DOCX through WPS and verify physical pagination.
 
@@ -4475,7 +4506,7 @@ def _pdf2docx_wps_render_quality_result(
     main conversion worker.  Short documents keep the fast structural path.
     """
 
-    if int(expected_pages) < _PDF2DOCX_WPS_RENDER_MIN_PAGES:
+    if not force and int(expected_pages) < _PDF2DOCX_WPS_RENDER_MIN_PAGES:
         return None, None
     try:
         from .wps import detect_wps_engines
@@ -10113,11 +10144,11 @@ def _convert_pdf_to_hybrid_docx(
         )
         return
 
-    risk_reasons: dict[int, list[str]] = {
-        assessment.page_index: list(assessment.reasons)
-        for assessment in assessments
-        if assessment.reasons
-    }
+    risk_reasons: dict[int, list[str]] = {}
+    for assessment in assessments:
+        reasons = list(assessment.reasons)
+        if reasons:
+            risk_reasons[assessment.page_index] = reasons
     for page_index in forced_indexes:
         risk_reasons.setdefault(page_index, []).append("用户指定原样保留")
 
@@ -10653,7 +10684,186 @@ def _convert_pdf_to_visual_docx(
         pdf_document.close()
 
 
-def _execute_pdf_to_docx(
+def _normalize_microsoft_pdf_reflow_docx(path: Path) -> int:
+    """Apply only font portability and the WPS soft-break compatibility flag."""
+
+    try:
+        from docx import Document
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+    except ImportError as exc:
+        raise MissingEngineError("Microsoft PDF Reflow 后处理需要 python-docx") from exc
+
+    document = Document(path)
+    changed = _normalize_docx_fonts(document)
+    settings = document.settings.element
+    compatibility = settings.find(qn("w:compat"))
+    if compatibility is None:
+        compatibility = OxmlElement("w:compat")
+        settings.insert_element_before(
+            compatibility,
+            "w:rsids",
+            "m:mathPr",
+            "w:themeFontLang",
+            "w:clrSchemeMapping",
+            "w:doNotAutoCompressPictures",
+        )
+        changed += 1
+    do_not_expand = compatibility.find(qn("w:doNotExpandShiftReturn"))
+    if do_not_expand is None:
+        do_not_expand = OxmlElement("w:doNotExpandShiftReturn")
+        compatibility.append(do_not_expand)
+        changed += 1
+    if do_not_expand.get(qn("w:val")) != "1":
+        do_not_expand.set(qn("w:val"), "1")
+        changed += 1
+    if changed:
+        document.save(path)
+    return changed
+
+
+def _pdf_word_docx_structure(path: Path) -> tuple[int, int, int]:
+    word_namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    tag = lambda name: f"{{{word_namespace}}}{name}"
+    try:
+        with ZipFile(path) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
+    except (BadZipFile, KeyError, ET.ParseError, OSError) as exc:
+        raise ValidationError(f"无法读取 Word 候选结构：{exc}") from exc
+    positioned = sum(1 for _ in root.iter(tag("framePr"))) + sum(
+        1 for _ in root.iter(tag("txbxContent"))
+    )
+    paragraphs = sum(1 for _ in root.iter(tag("p")))
+    tables = sum(1 for _ in root.iter(tag("tbl")))
+    return positioned, paragraphs, tables
+
+
+def _pdf_word_candidate_quality(
+    source: Path,
+    candidate: Path,
+    *,
+    password: str | None,
+    expected_pages: int,
+    render_check: bool,
+    progress: Callable[[float, str], None] | None = None,
+) -> _PdfWordCandidateQuality:
+    page_texts, _pages_without_text = _inspect_pdf_text_layers(source, password)
+    source_text = "\n".join(page_texts)
+    output_text = _extract_docx_text(candidate)
+    coverage = _text_sequence_coverage(source_text, output_text)
+    english_recall = _english_word_multiset_recall(source_text, output_text)
+    adjacent_coverage = _adjacent_english_word_coverage(source_text, output_text)
+    boundary_recovery_pass = _pdf_english_boundary_recovery_pass(
+        source_text,
+        output_text,
+        character_coverage=coverage,
+    )
+    text_passed = boundary_recovery_pass or bool(
+        coverage >= _MIN_EDITABLE_SEQUENCE_COVERAGE
+        and english_recall >= _MIN_EDITABLE_ENGLISH_WORD_RECALL
+        and adjacent_coverage >= _MIN_EDITABLE_ADJACENT_WORD_COVERAGE
+    )
+    layout_reasons = _pdf2docx_docx_layout_quality_reasons(candidate)
+    pagination_reason = None
+    pagination_warning = None
+    if render_check:
+        pagination_reason, pagination_warning = (
+            _pdf2docx_wps_render_quality_result(
+                source,
+                candidate,
+                expected_pages=expected_pages,
+                password=password,
+                progress=progress,
+                force=True,
+            )
+        )
+    positioned, paragraphs, tables = _pdf_word_docx_structure(candidate)
+    return _PdfWordCandidateQuality(
+        sequence_coverage=coverage,
+        english_word_recall=english_recall,
+        adjacent_word_coverage=adjacent_coverage,
+        layout_reasons=layout_reasons,
+        pagination_reason=pagination_reason,
+        pagination_warning=pagination_warning,
+        positioned_nodes=positioned,
+        paragraphs=paragraphs,
+        tables=tables,
+        text_passed=text_passed,
+    )
+
+
+def _convert_pdf_with_microsoft_reflow_candidate(
+    source: Path,
+    candidate: Path,
+    *,
+    password: str | None,
+    expected_pages: int,
+    low_quality_policy: str,
+    progress_start: float,
+    progress_span: float,
+) -> _PdfWordCandidateQuality:
+    from docuforge.runner import report_progress
+    from .office import microsoft_pdf_to_docx
+
+    if password:
+        raise ValidationError("Microsoft Word 原生 PDF Reflow 暂不支持无人值守打开加密 PDF")
+    source_megabytes = max(0.0, float(source.stat().st_size) / (1024.0 * 1024.0))
+    timeout = max(
+        180.0,
+        min(
+            3600.0,
+            150.0 + max(1, expected_pages) * 24.0 + source_megabytes * 8.0,
+        ),
+    )
+
+    def emit(local: float, message: str) -> None:
+        report_progress(
+            min(0.995, progress_start + max(0.0, min(1.0, local)) * progress_span),
+            message,
+        )
+
+    emit(0.02, "启动 Microsoft Word 原生 PDF Reflow 候选")
+    candidate.unlink(missing_ok=True)
+    microsoft_pdf_to_docx(source, candidate, timeout=timeout)
+    emit(0.58, "规范化 Office 候选字体与 WPS 兼容设置")
+    _normalize_microsoft_pdf_reflow_docx(candidate)
+    quality = _pdf_word_candidate_quality(
+        source,
+        candidate,
+        password=password,
+        expected_pages=expected_pages,
+        render_check=True,
+        progress=lambda ratio, message: emit(0.62 + ratio * 0.36, message),
+    )
+    if not quality.passed and low_quality_policy == "discard":
+        reasons: list[str] = []
+        if not quality.text_passed:
+            reasons.append(
+                "文字校验未通过（"
+                f"字符序列 {quality.sequence_coverage:.0%}、"
+                f"英文词召回 {quality.english_word_recall:.0%}、"
+                f"相邻词序 {quality.adjacent_word_coverage:.0%}）"
+            )
+        reasons.extend(quality.layout_reasons)
+        if quality.pagination_reason:
+            reasons.append(quality.pagination_reason)
+        raise ValidationError(
+            "Microsoft Word 原生 PDF Reflow 候选未通过二重质量检测："
+            f"{'；'.join(reasons) or '未知质量问题'}"
+        )
+    if quality.pagination_warning:
+        warnings.warn(quality.pagination_warning, stacklevel=2)
+    if not quality.passed:
+        warnings.warn(
+            "Microsoft Word 原生 PDF Reflow 候选未完全通过质量检测，"
+            "已按用户选择保留，请人工复核。",
+            stacklevel=2,
+        )
+    emit(1.0, "完成 Microsoft Word PDF Reflow 候选复检")
+    return quality
+
+
+def _execute_layoutloom_pdf_to_docx(
     source: Path,
     target: Path,
     *,
@@ -10664,28 +10874,23 @@ def _execute_pdf_to_docx(
     hybrid_force_visual_pages: str,
     column_layout: str,
 ) -> None:
-    """Execute one already-normalized conversion in the current process."""
-
-    normalized_mode = mode
-    normalized_quality_policy = low_quality_policy
-    normalized_column_layout = column_layout
-    if normalized_mode == "editable":
+    if mode == "editable":
         _convert_pdf_to_editable_docx(
             source,
             target,
             password=password,
-            low_quality_policy=normalized_quality_policy,
-            column_layout=normalized_column_layout,
+            low_quality_policy=low_quality_policy,
+            column_layout=column_layout,
         )
-    elif normalized_mode == "hybrid":
+    elif mode == "hybrid":
         _convert_pdf_to_hybrid_docx(
             source,
             target,
             password=password,
             dpi=int(dpi),
-            low_quality_policy=normalized_quality_policy,
+            low_quality_policy=low_quality_policy,
             force_visual_pages=hybrid_force_visual_pages,
-            column_layout=normalized_column_layout,
+            column_layout=column_layout,
         )
     else:
         _convert_pdf_to_visual_docx(
@@ -10696,6 +10901,82 @@ def _execute_pdf_to_docx(
         )
 
 
+def _execute_pdf_to_docx(
+    source: Path,
+    target: Path,
+    *,
+    password: str | None,
+    mode: str,
+    dpi: int,
+    low_quality_policy: str,
+    hybrid_force_visual_pages: str,
+    column_layout: str,
+    engine: str,
+) -> None:
+    """Execute one already-normalized PDF-to-Word conversion."""
+
+    normalized_mode = str(mode).lower().strip()
+    normalized_quality_policy = str(low_quality_policy).lower().strip()
+    normalized_column_layout = str(column_layout).lower().strip()
+    normalized_engine = str(engine).lower().strip()
+
+    if normalized_mode == "office_native" and normalized_engine == "layoutloom":
+        raise ValidationError(
+            "“Microsoft Word 原生转换”必须调用桌面版 Microsoft Word；"
+            "如需使用内置方案，请选择“全文可编辑重建”或“版式优先混合”"
+        )
+    if normalized_engine == "microsoft_office" and normalized_mode not in {
+        "editable",
+        "office_native",
+    }:
+        raise ValidationError(
+            "Microsoft Word 原生 PDF Reflow 只能用于“Microsoft Word 原生转换”；"
+            "旧版调用中的 editable + microsoft_office 组合仍予兼容"
+        )
+
+    use_microsoft_word = normalized_mode == "office_native" or (
+        normalized_mode == "editable" and normalized_engine == "microsoft_office"
+    )
+    if use_microsoft_word:
+        expected_pages = len(_inspect_pdf_text_layers(source, password)[0])
+        with _temporary_working_directory(
+            prefix="layoutloom-office-reflow-"
+        ) as folder:
+            candidate = folder / "office-native.docx"
+            office_quality = _convert_pdf_with_microsoft_reflow_candidate(
+                source,
+                candidate,
+                password=password,
+                expected_pages=expected_pages,
+                low_quality_policy=normalized_quality_policy,
+                progress_start=0.04,
+                progress_span=0.94,
+            )
+            with atomic_output(target) as temporary:
+                shutil.copy2(candidate, temporary)
+        if office_quality.passed:
+            warnings.warn(
+                "本次已直接使用 Microsoft Word 原生 PDF Reflow，并通过质量检查。",
+                stacklevel=2,
+            )
+        else:
+            warnings.warn(
+                "本次已直接使用 Microsoft Word 原生 PDF Reflow；"
+                "质量检查未完全通过，已按用户选择保留结果，请人工复核。",
+                stacklevel=2,
+            )
+        return
+
+    _execute_layoutloom_pdf_to_docx(
+        source,
+        target,
+        password=password,
+        mode=normalized_mode,
+        dpi=dpi,
+        low_quality_policy=normalized_quality_policy,
+        hybrid_force_visual_pages=hybrid_force_visual_pages,
+        column_layout=normalized_column_layout,
+    )
 def _pdf_to_docx_worker(
     connection: object,
     cancel_event: object,
@@ -10763,6 +11044,7 @@ def _pdf_to_docx_worker(
                         payload["hybrid_force_visual_pages"]
                     ),
                     column_layout=str(payload["column_layout"]),
+                    engine=str(payload["engine"]),
                 )
         send(
             {
@@ -10798,6 +11080,7 @@ def _run_pdf_to_docx_supervised(
     low_quality_policy: str,
     hybrid_force_visual_pages: str,
     column_layout: str,
+    engine: str,
 ) -> None:
     import multiprocessing
 
@@ -10824,6 +11107,7 @@ def _run_pdf_to_docx_supervised(
                 "low_quality_policy": low_quality_policy,
                 "hybrid_force_visual_pages": hybrid_force_visual_pages,
                 "column_layout": column_layout,
+                "engine": engine,
             },
         ),
         name="docuforge-pdf-to-word",
@@ -10921,21 +11205,29 @@ def pdf_to_docx(
     low_quality_policy: str = "discard",
     hybrid_force_visual_pages: str = "",
     column_layout: str = "auto",
+    engine: str = "auto",
     overwrite: bool = False,
 ) -> list[Path]:
-    """Convert a PDF to an editable, hybrid, or pixel-faithful DOCX."""
+    """Convert a PDF with LayoutLoom reconstruction or Word's native Reflow."""
 
     from docuforge.runner import report_progress, task_runner_active
 
     source = Path(input_pdf)
     target = unique_path(output_path, overwrite)
     normalized_mode = mode.lower().strip()
-    if normalized_mode not in {"editable", "hybrid", "visual"}:
-        raise ValidationError("Word 内容模式必须是 editable、hybrid 或 visual")
+    if normalized_mode not in {"editable", "hybrid", "office_native", "visual"}:
+        raise ValidationError(
+            "Word 内容模式必须是 editable、hybrid、office_native 或 visual"
+        )
     normalized_quality_policy = str(low_quality_policy).lower().strip()
     if normalized_quality_policy not in {"discard", "keep"}:
         raise ValidationError("低质量结果处理策略必须是 discard 或 keep")
     normalized_column_layout = _normalize_pdf2docx_column_layout(column_layout)
+    normalized_engine = str(engine).lower().strip()
+    if normalized_engine not in {"auto", "layoutloom", "microsoft_office"}:
+        raise ValidationError(
+            "PDF 转 Word 引擎必须是 auto、layoutloom 或 microsoft_office"
+        )
     arguments = {
         "password": password,
         "mode": normalized_mode,
@@ -10943,6 +11235,7 @@ def pdf_to_docx(
         "low_quality_policy": normalized_quality_policy,
         "hybrid_force_visual_pages": hybrid_force_visual_pages,
         "column_layout": normalized_column_layout,
+        "engine": normalized_engine,
     }
     if task_runner_active():
         _run_pdf_to_docx_supervised(source, target, **arguments)

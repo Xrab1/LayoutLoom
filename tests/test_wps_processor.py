@@ -125,6 +125,161 @@ class WpsProcessorTests(unittest.TestCase):
         self.assertEqual(events[0], "initialize")
         self.assertEqual(events[-1], "uninitialize")
 
+    def test_wps_rejects_unowned_existing_process_without_quitting_it(self) -> None:
+        events: list[str] = []
+
+        class PythonCom:
+            @staticmethod
+            def CoInitialize() -> None:
+                events.append("initialize")
+
+            @staticmethod
+            def CoUninitialize() -> None:
+                events.append("uninitialize")
+
+        class Application:
+            def Quit(self) -> None:
+                events.append("quit")
+
+        class Client:
+            @staticmethod
+            def DispatchEx(_prog_id: str) -> Application:
+                return Application()
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            executable = root / "wps.exe"
+            executable.touch()
+            source = root / "合同.docx"
+            source.write_bytes(b"placeholder")
+            statuses = {
+                "writer": wps.WpsEngineStatus(
+                    True,
+                    "writer",
+                    "KWPS.Application",
+                    executable=executable,
+                ),
+                "spreadsheets": wps.WpsEngineStatus(
+                    False, "spreadsheets", "KET.Application"
+                ),
+                "presentation": wps.WpsEngineStatus(
+                    False, "presentation", "KWPP.Application"
+                ),
+            }
+            with patch.object(
+                wps, "detect_wps_engines", return_value=statuses
+            ), patch.object(
+                wps, "_load_pywin32", return_value=(PythonCom, Client)
+            ), patch(
+                "docuforge.processors.office._windows_process_snapshot",
+                return_value={},
+            ), patch(
+                "docuforge.processors.office._office_application_pid",
+                return_value=321,
+            ), patch(
+                "docuforge.processors.office._new_owned_office_process",
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(MissingEngineError, "无文档空闲状态"):
+                    convert_with_wps(source, root / "out", "pdf")
+
+        self.assertEqual(events, ["initialize", "uninitialize"])
+
+    def test_wps_reuses_idle_instance_and_restores_global_settings(self) -> None:
+        events: list[str] = []
+
+        class PythonCom:
+            @staticmethod
+            def CoInitialize() -> None:
+                events.append("initialize")
+
+            @staticmethod
+            def CoUninitialize() -> None:
+                events.append("uninitialize")
+
+        class Document:
+            def SaveAs(self, path: str, _format_code: int) -> None:
+                Path(path).write_bytes(b"converted")
+
+            def Close(self, _save: bool) -> None:
+                events.append("close")
+
+        class Documents:
+            Count = 0
+
+            def Open(self, _path: str, **_kwargs: object) -> Document:
+                return Document()
+
+        class Application:
+            def __init__(self) -> None:
+                self.Documents = Documents()
+                self.AutomationSecurity = 1
+                self.Visible = True
+                self.DisplayAlerts = 1
+                self.ScreenUpdating = True
+                self.EnableEvents = True
+                self.AskToUpdateLinks = True
+
+            def Quit(self) -> None:
+                events.append("quit")
+
+        application = Application()
+
+        class Client:
+            @staticmethod
+            def DispatchEx(_prog_id: str) -> Application:
+                return application
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            executable = (root / "wps.exe").resolve()
+            executable.touch()
+            source = root / "合同.docx"
+            source.write_bytes(b"placeholder")
+            identity = type("Identity", (), {"executable": executable})()
+            statuses = {
+                "writer": wps.WpsEngineStatus(
+                    True,
+                    "writer",
+                    "KWPS.Application",
+                    executable=executable,
+                ),
+                "spreadsheets": wps.WpsEngineStatus(
+                    False, "spreadsheets", "KET.Application"
+                ),
+                "presentation": wps.WpsEngineStatus(
+                    False, "presentation", "KWPP.Application"
+                ),
+            }
+            with patch.object(
+                wps, "detect_wps_engines", return_value=statuses
+            ), patch.object(
+                wps, "_load_pywin32", return_value=(PythonCom, Client)
+            ), patch(
+                "docuforge.processors.office._windows_process_snapshot",
+                return_value={},
+            ), patch(
+                "docuforge.processors.office._office_application_pid",
+                return_value=321,
+            ), patch(
+                "docuforge.processors.office._new_owned_office_process",
+                return_value=None,
+            ), patch(
+                "docuforge.processors.office._windows_process_identity",
+                return_value=identity,
+            ):
+                output = convert_with_wps(source, root / "out", "docx")
+                output_bytes = output[0].read_bytes()
+
+        self.assertEqual(output_bytes, b"converted")
+        self.assertNotIn("quit", events)
+        self.assertEqual(application.AutomationSecurity, 1)
+        self.assertTrue(application.Visible)
+        self.assertEqual(application.DisplayAlerts, 1)
+        self.assertTrue(application.ScreenUpdating)
+        self.assertTrue(application.EnableEvents)
+        self.assertTrue(application.AskToUpdateLinks)
+
     def test_spreadsheets_open_safely_and_prepare_layout_before_export(
         self,
     ) -> None:

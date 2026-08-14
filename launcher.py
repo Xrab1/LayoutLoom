@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
+import traceback
 from collections.abc import Sequence
+from pathlib import Path
+
+
+_SELF_TEST_ERROR_FILE_ENV = "LAYOUTLOOM_SELF_TEST_ERROR_FILE"
 
 
 def launch() -> None:
@@ -96,7 +102,19 @@ def self_test() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if "--self-test" in arguments:
-        return self_test()
+        try:
+            return self_test()
+        except Exception:
+            error_file = os.environ.get(_SELF_TEST_ERROR_FILE_ENV)
+            if not error_file:
+                raise
+            try:
+                error_path = Path(error_file)
+                error_path.parent.mkdir(parents=True, exist_ok=True)
+                error_path.write_text(traceback.format_exc(), encoding="utf-8")
+            except OSError:
+                pass
+            return 87
     launch()
     return 0
 

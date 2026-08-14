@@ -755,7 +755,12 @@ class OfficeEngineSelectionTests(unittest.TestCase):
 
     def test_supervised_com_conversion_approves_only_new_exact_process(self) -> None:
         parent_messages = [
-            {"type": "office_process", "pid": 321, "prog_id": "Excel.Application"},
+            {
+                "type": "office_process",
+                "pid": 321,
+                "prog_id": "Excel.Application",
+                "executable": "C:/Program Files/Microsoft Office/EXCEL.EXE",
+            },
             {"type": "result", "ok": True},
         ]
         ownership_responses: list[dict[str, object]] = []
@@ -822,7 +827,106 @@ class OfficeEngineSelectionTests(unittest.TestCase):
             office._convert_com_supervised(source, target, "pdf", timeout=5)
 
         self.assertTrue(context.assert_duplex)
-        self.assertEqual(ownership_responses, [{"type": "ownership", "approved": True}])
+        self.assertEqual(
+            ownership_responses,
+            [{"type": "ownership", "approved": True, "pid": 321}],
+        )
+
+    def test_word_pdf_prompt_handler_clicks_only_owned_reflow_dialog(self) -> None:
+        windows = [10, 20]
+        owners = {10: 777, 20: 888}
+        posted: list[tuple[int, ...]] = []
+        win32con = types.ModuleType("win32con")
+        win32con.WM_COMMAND = 0x0111  # type: ignore[attr-defined]
+        win32con.IDOK = 1  # type: ignore[attr-defined]
+        win32con.SMTO_ABORTIFHUNG = 2  # type: ignore[attr-defined]
+        win32con.WM_KEYDOWN = 0x0100  # type: ignore[attr-defined]
+        win32con.WM_CHAR = 0x0102  # type: ignore[attr-defined]
+        win32con.WM_KEYUP = 0x0101  # type: ignore[attr-defined]
+        win32con.VK_RETURN = 0x0D  # type: ignore[attr-defined]
+        win32con.SW_HIDE = 0  # type: ignore[attr-defined]
+        win32process = types.ModuleType("win32process")
+        win32process.GetWindowThreadProcessId = (  # type: ignore[attr-defined]
+            lambda handle: (1, owners[handle])
+        )
+        win32gui = types.ModuleType("win32gui")
+        win32gui.EnumWindows = (  # type: ignore[attr-defined]
+            lambda callback, extra: [callback(handle, extra) for handle in windows]
+        )
+        win32gui.GetWindowText = lambda _handle: "Microsoft Word"  # type: ignore[attr-defined]
+        win32gui.GetClassName = lambda _handle: "NUIDialog"  # type: ignore[attr-defined]
+        win32gui.SendMessageTimeout = lambda *args: posted.append(args)  # type: ignore[attr-defined]
+        win32gui.ShowWindow = lambda *args: posted.append(("hide", *args))  # type: ignore[attr-defined]
+        win32gui.EnumChildWindows = (  # type: ignore[attr-defined]
+            lambda handle, callback, extra: callback(30, extra) if handle == 20 else None
+        )
+
+        with patch.object(office.sys, "platform", "win32"), patch.dict(
+            "sys.modules",
+            {
+                "win32con": win32con,
+                "win32gui": win32gui,
+                "win32process": win32process,
+            },
+        ):
+            self.assertTrue(office._dismiss_owned_pdf_reflow_prompt_once(888))
+
+        self.assertEqual(
+            posted,
+            [
+                ("hide", 20, 0),
+                (20, 0x0111, 1, 0, 2, 500),
+                (30, 0x0100, 0x0D, 0, 2, 500),
+                (30, 0x0102, 13, 0, 2, 500),
+                (30, 0x0101, 0x0D, 0xC0000001, 2, 500),
+                (20, 0x0100, 0x0D, 0, 2, 500),
+                (20, 0x0102, 13, 0, 2, 500),
+                (20, 0x0101, 0x0D, 0xC0000001, 2, 500),
+            ],
+        )
+
+    def test_hidden_com_instance_uses_unique_new_process_snapshot(self) -> None:
+        expected = Path("C:/Program Files/Microsoft Office/WINWORD.EXE")
+        old = office._OfficeProcessIdentity(100, expected, "old")
+        new = office._OfficeProcessIdentity(321, expected, "new")
+        with patch.object(
+            office, "_windows_process_snapshot", return_value={100: old, 321: new}
+        ), patch.object(office, "_windows_process_identity") as identity:
+            approved = office._new_owned_office_process(
+                {100: old}, expected_executable=expected, reported_pid=None
+            )
+
+        self.assertEqual(approved, new)
+        identity.assert_not_called()
+
+    def test_hidden_com_instance_rejects_ambiguous_new_processes(self) -> None:
+        expected = Path("C:/Program Files/Microsoft Office/WINWORD.EXE")
+        first = office._OfficeProcessIdentity(321, expected, "first")
+        second = office._OfficeProcessIdentity(654, expected, "second")
+        with patch.object(
+            office,
+            "_windows_process_snapshot",
+            return_value={321: first, 654: second},
+        ):
+            approved = office._new_owned_office_process(
+                {}, expected_executable=expected, reported_pid=None
+            )
+
+        self.assertIsNone(approved)
+
+    def test_hidden_com_instance_rejects_wrong_install_path(self) -> None:
+        expected = Path("C:/Program Files/Microsoft Office/WINWORD.EXE")
+        wrong = office._OfficeProcessIdentity(
+            321, Path("D:/Other Office/WINWORD.EXE"), "new"
+        )
+        with patch.object(
+            office, "_windows_process_snapshot", return_value={321: wrong}
+        ):
+            approved = office._new_owned_office_process(
+                {}, expected_executable=expected, reported_pid=None
+            )
+
+        self.assertIsNone(approved)
 
     def test_supervised_com_timeout_stops_worker(self) -> None:
         class ParentConnection:
@@ -863,6 +967,86 @@ class OfficeEngineSelectionTests(unittest.TestCase):
                 )
 
         stop_worker.assert_called_once()
+
+    def test_word_pdf_timeout_rescans_and_stops_late_reflow_process(self) -> None:
+        messages = [
+            {
+                "type": "office_process",
+                "pid": 321,
+                "prog_id": "Word.Application",
+                "executable": "C:/Program Files/Microsoft Office/WINWORD.EXE",
+            }
+        ]
+
+        class ParentConnection:
+            def poll(self, _timeout: float) -> bool:
+                return bool(messages)
+
+            def recv(self) -> dict[str, object]:
+                return messages.pop(0)
+
+            def send(self, _message: dict[str, object]) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        class ChildConnection:
+            def close(self) -> None:
+                return None
+
+        class Process:
+            def start(self) -> None:
+                return None
+
+            def is_alive(self) -> bool:
+                return True
+
+        class Context:
+            def Pipe(self, *, duplex: bool) -> tuple[ParentConnection, ChildConnection]:
+                return ParentConnection(), ChildConnection()
+
+            def Process(self, **_kwargs: object) -> Process:
+                return Process()
+
+        word_identity = office._OfficeProcessIdentity(
+            321,
+            Path("C:/Program Files/Microsoft Office/WINWORD.EXE"),
+            "word-created",
+        )
+        reflow_identity = office._OfficeProcessIdentity(
+            654,
+            Path("C:/Program Files/Microsoft Office/PDFREFLOW.EXE"),
+            "reflow-created",
+        )
+        reflow_path = Path("C:/Program Files/Microsoft Office/PDFREFLOW.EXE")
+        with patch("multiprocessing.get_context", return_value=Context()), patch.object(
+            office, "_windows_process_snapshot", return_value={}
+        ), patch.object(
+            office,
+            "_new_owned_office_process",
+            side_effect=[word_identity, None, reflow_identity],
+        ), patch.object(
+            office.time, "monotonic", side_effect=[0.0, 0.1, 1.0]
+        ), patch.object(
+            office, "_stop_com_worker"
+        ) as stop_worker:
+            with self.assertRaisesRegex(
+                MissingEngineError,
+                "关闭 Word 后重试",
+            ):
+                office._convert_com_supervised(
+                    Path("source.pdf"),
+                    Path("target.docx"),
+                    "docx",
+                    timeout=0.5,
+                    component_override="microsoft_word",
+                    auxiliary_executables=(reflow_path,),
+                )
+
+        stop_worker.assert_called_once()
+        self.assertEqual(stop_worker.call_args.args[1], word_identity)
+        self.assertEqual(stop_worker.call_args.args[2], (reflow_identity,))
 
     def test_microsoft_excel_registration_rejects_wps_and_missing_servers(
         self,
@@ -1010,6 +1194,63 @@ class OfficeEngineSelectionTests(unittest.TestCase):
 
         self.assertEqual(events, [("export", 17)])
 
+    def test_word_pdf_reflow_opens_pdf_and_saves_docx(self) -> None:
+        events: list[object] = []
+
+        class Document:
+            def SaveAs2(self, path: str, **kwargs: object) -> None:
+                events.append(("save", kwargs))
+                Path(path).write_bytes(b"docx")
+
+            def Close(self, save: bool) -> None:
+                events.append(("close", save))
+
+        class Documents:
+            def Open(self, path: str, **kwargs: object) -> Document:
+                events.append(("open", Path(path), kwargs))
+                return Document()
+
+        class Options:
+            ConfirmConversions = True
+
+        class Application:
+            def __init__(self) -> None:
+                self.Documents = Documents()
+                self.Options = Options()
+
+            def Quit(self) -> None:
+                events.append("quit")
+
+        pythoncom = types.ModuleType("pythoncom")
+        pythoncom.CoInitialize = lambda: events.append("initialize")  # type: ignore[attr-defined]
+        pythoncom.CoUninitialize = lambda: events.append("uninitialize")  # type: ignore[attr-defined]
+        client = types.ModuleType("win32com.client")
+        client.DispatchEx = lambda _prog_id: Application()  # type: ignore[attr-defined]
+        win32com = types.ModuleType("win32com")
+        win32com.client = client  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+            "sys.modules",
+            {"pythoncom": pythoncom, "win32com": win32com, "win32com.client": client},
+        ), patch.object(office, "_validate_microsoft_com_application"), patch.object(
+            office, "_disable_automation_macros"
+        ):
+            root = Path(folder)
+            source = root / "source.pdf"
+            target = root / "target.docx"
+            source.write_bytes(b"pdf")
+            office._convert_com(source, target, "docx")
+
+        opening = next(event for event in events if isinstance(event, tuple) and event[0] == "open")
+        saving = next(event for event in events if isinstance(event, tuple) and event[0] == "save")
+        self.assertEqual(opening[1].suffix.lower(), ".pdf")
+        self.assertNotEqual(opening[1], source)
+        self.assertFalse(opening[1].exists())
+        self.assertFalse(opening[2]["ConfirmConversions"])
+        self.assertEqual(saving[1]["FileFormat"], 16)
+        self.assertLess(events.index(opening), events.index(saving))
+        self.assertEqual(events[-1], "uninitialize")
+
     def test_powerpoint_conversion_closes_presentation_without_arguments(self) -> None:
         events: list[object] = []
 
@@ -1068,7 +1309,7 @@ class OfficeEngineSelectionTests(unittest.TestCase):
                 return True
 
             def recv(self) -> dict[str, object]:
-                return {"type": "ownership", "approved": True}
+                return {"type": "ownership", "approved": True, "pid": 321}
 
             def close(self) -> None:
                 return None
@@ -1098,6 +1339,7 @@ class OfficeEngineSelectionTests(unittest.TestCase):
 
         self.assertEqual(messages[0]["type"], "office_process")
         self.assertEqual(messages[0]["pid"], 321)
+        self.assertEqual(messages[0]["prog_id"], "Word.Application")
         self.assertEqual(messages[-1], {"type": "result", "ok": True})
 
     def test_unowned_com_instance_is_not_quit(self) -> None:
@@ -1229,6 +1471,8 @@ class OfficeEngineSelectionTests(unittest.TestCase):
             engines, "find_executable", return_value=None
         ), patch.object(
             engines, "_known_soffice_paths", return_value=[]
+        ), patch.object(
+            engines, "_known_microsoft_office_paths", return_value=[]
         ):
             engines.office_render_capability.cache_clear()
             capability = engines.office_render_capability("powerpoint")

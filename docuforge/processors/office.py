@@ -30,6 +30,7 @@ import time
 import uuid
 import warnings
 import zipfile
+from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -2393,6 +2394,46 @@ def _windows_process_snapshot(
     return snapshot
 
 
+def _new_owned_office_process(
+    before: Mapping[int, _OfficeProcessIdentity],
+    *,
+    expected_executable: Path,
+    reported_pid: int | None = None,
+) -> _OfficeProcessIdentity | None:
+    """Return the one newly-created Office process that is safe to own.
+
+    Hidden Word instances do not always expose ``Application.Hwnd``.  In that
+    case the COM worker cannot report a PID, so compare exact process snapshots
+    instead.  We only accept a unique new PID/path/creation tuple and never
+    guess when Office started more than one matching process.
+    """
+
+    try:
+        expected_path = expected_executable.expanduser().resolve()
+    except OSError:
+        expected_path = expected_executable.expanduser().absolute()
+    expected_name = expected_path.name.casefold()
+
+    if reported_pid is not None and reported_pid > 0:
+        identity = _windows_process_identity(int(reported_pid))
+        previous = before.get(int(reported_pid))
+        if (
+            identity is not None
+            and identity != previous
+            and identity.executable == expected_path
+        ):
+            return identity
+        return None
+
+    after = _windows_process_snapshot(expected_name)
+    candidates = [
+        identity
+        for process_id, identity in after.items()
+        if identity != before.get(process_id) and identity.executable == expected_path
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _terminate_owned_office_process(identity: _OfficeProcessIdentity) -> bool:
     """Terminate only the exact Office instance previously approved as ours."""
 
@@ -2426,8 +2467,165 @@ def _wait_for_owned_office_exit(
     _terminate_owned_office_process(identity)
 
 
-def _registered_office_application(prog_id: str) -> bool:
-    """Return whether *prog_id* resolves to the real Microsoft application.
+@contextmanager
+def _word_pdf_reflow_prompt_suppressed(version: str = "16.0") -> Iterable[None]:
+    """Temporarily suppress Word's informational PDF conversion prompt.
+
+    ``Application.DisplayAlerts`` does not cover this modal dialog.  The
+    documented UI checkbox stores a per-user option, so set it only while the
+    supervised candidate is running and restore the exact prior registry value
+    afterwards.  This does not alter Protected View or macro security.
+    """
+
+    if sys.platform != "win32":
+        yield
+        return
+    try:
+        import winreg
+    except ImportError:
+        yield
+        return
+
+    key_path = rf"Software\Microsoft\Office\{version}\Word\Options"
+    value_name = "DisableConvertPrompt"
+    key = None
+    had_value = False
+    previous_value: Any = None
+    previous_type = int(getattr(winreg, "REG_DWORD", 4))
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            key_path,
+            0,
+            int(getattr(winreg, "KEY_READ", 0))
+            | int(getattr(winreg, "KEY_SET_VALUE", 0)),
+        )
+        try:
+            previous_value, previous_type = winreg.QueryValueEx(key, value_name)
+            had_value = True
+        except OSError:
+            pass
+        winreg.SetValueEx(
+            key,
+            value_name,
+            0,
+            int(getattr(winreg, "REG_DWORD", 4)),
+            1,
+        )
+        yield
+    finally:
+        if key is not None:
+            try:
+                if had_value:
+                    winreg.SetValueEx(
+                        key, value_name, 0, int(previous_type), previous_value
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, value_name)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    winreg.CloseKey(key)
+                except OSError:
+                    pass
+
+
+def _dismiss_owned_pdf_reflow_prompt_once(process_id: int) -> bool:
+    """Silently confirm the NUI dialog owned by our exact PDFREFLOW process.
+
+    The NetUI prompt does not expose a normal Win32 button.  Sending a global
+    Enter key used to work around that limitation, but it also stole focus,
+    flashed the dialog and could play the Windows warning sound.  Hide the
+    verified task-owned window first, then send Enter directly to its NetUI
+    child and parent windows without foreground activation or global input.
+    """
+
+    if sys.platform != "win32" or process_id <= 0:
+        return False
+    try:
+        import win32con
+        import win32gui
+        import win32process
+    except ImportError:
+        return False
+
+    windows: list[int] = []
+    try:
+        win32gui.EnumWindows(lambda handle, _extra: windows.append(handle), None)
+    except Exception:
+        return False
+
+    for window_handle in windows:
+        try:
+            _thread_id, owner_pid = win32process.GetWindowThreadProcessId(
+                window_handle
+            )
+        except Exception:
+            continue
+        if int(owner_pid or 0) != int(process_id):
+            continue
+        try:
+            class_name = str(win32gui.GetClassName(window_handle) or "")
+            title = str(win32gui.GetWindowText(window_handle) or "").strip()
+        except Exception:
+            continue
+        if class_name != "NUIDialog" or title.casefold() != "microsoft word":
+            continue
+        try:
+            win32gui.ShowWindow(
+                window_handle,
+                int(getattr(win32con, "SW_HIDE", 0)),
+            )
+            win32gui.SendMessageTimeout(
+                window_handle,
+                int(getattr(win32con, "WM_COMMAND", 0x0111)),
+                int(getattr(win32con, "IDOK", 1)),
+                0,
+                int(getattr(win32con, "SMTO_ABORTIFHUNG", 0x0002)),
+                500,
+            )
+            child_windows: list[int] = []
+            win32gui.EnumChildWindows(
+                window_handle,
+                lambda child, _extra: child_windows.append(child),
+                None,
+            )
+            for target_handle in [*child_windows, window_handle]:
+                for message, key_code, flags in (
+                    (
+                        int(getattr(win32con, "WM_KEYDOWN", 0x0100)),
+                        int(getattr(win32con, "VK_RETURN", 0x0D)),
+                        0,
+                    ),
+                    (
+                        int(getattr(win32con, "WM_CHAR", 0x0102)),
+                        13,
+                        0,
+                    ),
+                    (
+                        int(getattr(win32con, "WM_KEYUP", 0x0101)),
+                        int(getattr(win32con, "VK_RETURN", 0x0D)),
+                        0xC0000001,
+                    ),
+                ):
+                    win32gui.SendMessageTimeout(
+                        target_handle,
+                        message,
+                        key_code,
+                        flags,
+                        int(getattr(win32con, "SMTO_ABORTIFHUNG", 0x0002)),
+                        500,
+                    )
+        except Exception:
+            continue
+        return True
+    return False
+
+
+def _registered_office_executable(prog_id: str) -> Path | None:
+    """Return the verified Microsoft Office executable for *prog_id*.
 
     WPS can register compatibility ProgIDs such as ``Excel.Application``.  A
     ProgID/CLSID key alone therefore produces false positives and can make auto
@@ -2438,15 +2636,15 @@ def _registered_office_application(prog_id: str) -> bool:
     """
 
     if sys.platform != "win32":
-        return False
+        return None
     try:
         import winreg
     except ImportError:
-        return False
+        return None
     expected_name = _MICROSOFT_COM_EXECUTABLES.get(prog_id)
     expected_clsid = _MICROSOFT_COM_CLSIDS.get(prog_id)
     if expected_name is None or expected_clsid is None:
-        return False
+        return None
 
     access_modes: list[int] = []
     for attribute in ("KEY_WOW64_64KEY", "KEY_WOW64_32KEY"):
@@ -2482,8 +2680,14 @@ def _registered_office_application(prog_id: str) -> bool:
         executable = Path(executable_text)
         if executable.name.casefold() != expected_name or not executable.is_file():
             continue
-        return True
-    return False
+        return executable.resolve()
+    return None
+
+
+def _registered_office_application(prog_id: str) -> bool:
+    """Return whether *prog_id* resolves to the real Microsoft application."""
+
+    return _registered_office_executable(prog_id) is not None
 
 
 def _pywin32_available() -> bool:
@@ -2762,7 +2966,7 @@ def _convert_com(
     excel_pdf_paper: str = "auto",
     excel_pdf_orientation: str = "auto",
     excel_pdf_margin: str = "auto",
-    ownership_guard: Callable[[Any, str], bool] | None = None,
+    ownership_guard: Callable[[Any, str], bool | int | None] | None = None,
 ) -> None:
     suffix = source.suffix.lower()
     if suffix in _PPT_EXTENSIONS | {".ppt"} and target_format in {"png", "jpg"}:
@@ -2778,6 +2982,7 @@ def _convert_com(
     pythoncom.CoInitialize()
     application = None
     document = None
+    staged_source_directory: tempfile.TemporaryDirectory[str] | None = None
     application_owned = ownership_guard is None
 
     def claim_application(prog_id: str, display_name: str) -> None:
@@ -2788,7 +2993,8 @@ def _convert_com(
         # Until the parent confirms the exact PID/path/creation tuple, never
         # assume a DispatchEx result is safe to Quit or terminate.
         application_owned = False
-        if not bool(ownership_guard(application, prog_id)):
+        ownership = ownership_guard(application, prog_id)
+        if not bool(ownership):
             raise MissingEngineError(
                 f"Microsoft {display_name} 复用了无法确认归属的现有进程；"
                 "为保护用户已打开的文档，已停止自动化"
@@ -2796,15 +3002,62 @@ def _convert_com(
         application_owned = True
 
     try:
-        if suffix in _WORD_EXTENSIONS | {".doc", ".rtf"}:
+        if suffix == ".pdf":
+            if target_format != "docx":
+                raise ValidationError("Microsoft Word PDF Reflow 仅支持输出 DOCX")
             application = win32com.client.DispatchEx("Word.Application")
             _validate_microsoft_com_application(application, "Word.Application", "Word")
             claim_application("Word.Application", "Word")
             _disable_automation_macros(application, "Word")
             application.Visible = False
             application.DisplayAlerts = 0
+            try:
+                application.Options.ConfirmConversions = False
+            except Exception:
+                pass
+            # A previous interrupted PDF Reflow can make Word remember the
+            # original path as a failed document and show an unsuppressible
+            # recovery prompt.  A byte-identical copy at a fresh private path
+            # avoids inheriting that stale per-file recovery state.
+            staged_source_directory = tempfile.TemporaryDirectory(
+                prefix="layoutloom-word-reflow-"
+            )
+            staged_source = (
+                Path(staged_source_directory.name) / f"input-{uuid.uuid4().hex}.pdf"
+            )
+            shutil.copyfile(source, staged_source)
             document = application.Documents.Open(
-                str(source), ReadOnly=True, AddToRecentFiles=False
+                str(staged_source),
+                ConfirmConversions=False,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+                Revert=False,
+                Visible=False,
+                OpenAndRepair=False,
+                NoEncodingDialog=True,
+            )
+            document.SaveAs2(str(target), FileFormat=16, AddToRecentFiles=False)
+        elif suffix in _WORD_EXTENSIONS | {".doc", ".rtf"}:
+            application = win32com.client.DispatchEx("Word.Application")
+            _validate_microsoft_com_application(application, "Word.Application", "Word")
+            claim_application("Word.Application", "Word")
+            _disable_automation_macros(application, "Word")
+            application.Visible = False
+            application.DisplayAlerts = 0
+            try:
+                application.Options.ConfirmConversions = False
+                application.Options.SaveNormalPrompt = False
+            except Exception:
+                pass
+            document = application.Documents.Open(
+                str(source),
+                ConfirmConversions=False,
+                ReadOnly=True,
+                AddToRecentFiles=False,
+                Revert=False,
+                Visible=False,
+                OpenAndRepair=False,
+                NoEncodingDialog=True,
             )
             if target_format == "pdf":
                 document.ExportAsFixedFormat(str(target), 17)
@@ -2865,8 +3118,13 @@ def _convert_com(
             )
             claim_application("PowerPoint.Application", "PowerPoint")
             _disable_automation_macros(application, "PowerPoint")
+            try:
+                application.Visible = False
+                application.DisplayAlerts = 1  # ppAlertsNone
+            except Exception:
+                pass
             document = application.Presentations.Open(
-                str(source), WithWindow=False, ReadOnly=True
+                str(source), WithWindow=False, ReadOnly=True, Untitled=False
             )
             formats = {"pdf": 32, "pptx": 24}
             if target_format not in formats:
@@ -2900,6 +3158,11 @@ def _convert_com(
                 application.Quit()
             except Exception:
                 pass
+        if staged_source_directory is not None:
+            try:
+                staged_source_directory.cleanup()
+            except OSError:
+                pass
         pythoncom.CoUninitialize()
 
 
@@ -2919,14 +3182,24 @@ def _convert_com_worker_entry(
 ) -> None:
     """Spawn-safe worker for one isolated Microsoft Office COM conversion."""
 
-    def confirm_ownership(application: Any, prog_id: str) -> bool:
+    def confirm_ownership(application: Any, prog_id: str) -> bool | int:
         process_id = _office_application_pid(application)
+        expected_name = _MICROSOFT_COM_EXECUTABLES.get(prog_id, "")
+        expected_path = ""
+        if expected_name:
+            try:
+                expected_path = str(
+                    (Path(str(application.Path).strip()) / expected_name).resolve()
+                )
+            except Exception:
+                expected_path = ""
         _send_com_worker_message(
             connection,
             {
                 "type": "office_process",
                 "pid": process_id,
                 "prog_id": prog_id,
+                "executable": expected_path,
             },
         )
         try:
@@ -2935,11 +3208,17 @@ def _convert_com_worker_entry(
             response = connection.recv()
         except (EOFError, OSError):
             return False
-        return bool(
+        if not (
             isinstance(response, Mapping)
             and response.get("type") == "ownership"
             and response.get("approved") is True
-        )
+        ):
+            return False
+        try:
+            approved_pid = int(response.get("pid") or 0)
+        except (TypeError, ValueError):
+            approved_pid = 0
+        return approved_pid if approved_pid > 0 else True
 
     try:
         _convert_com(
@@ -2986,9 +3265,15 @@ def _convert_com_worker_entry(
             pass
 
 
-def _stop_com_worker(process: Any, identity: _OfficeProcessIdentity | None) -> None:
+def _stop_com_worker(
+    process: Any,
+    identity: _OfficeProcessIdentity | None,
+    auxiliary_identities: Sequence[_OfficeProcessIdentity] = (),
+) -> None:
     """Stop only the worker and Office instance whose ownership was confirmed."""
 
+    for auxiliary in auxiliary_identities:
+        _terminate_owned_office_process(auxiliary)
     if identity is not None:
         _terminate_owned_office_process(identity)
     try:
@@ -3019,6 +3304,8 @@ def _stop_com_worker(process: Any, identity: _OfficeProcessIdentity | None) -> N
         except Exception:
             pass
     _wait_for_owned_office_exit(identity, timeout=0.5)
+    for auxiliary in auxiliary_identities:
+        _wait_for_owned_office_exit(auxiliary, timeout=0.5)
 
 
 def _convert_com_supervised(
@@ -3031,6 +3318,8 @@ def _convert_com_supervised(
     excel_pdf_paper: str = "auto",
     excel_pdf_orientation: str = "auto",
     excel_pdf_margin: str = "auto",
+    component_override: str | None = None,
+    auxiliary_executables: Sequence[Path] = (),
 ) -> None:
     """Run COM in an isolated process so timeout and cancellation are enforceable."""
 
@@ -3038,10 +3327,16 @@ def _convert_com_supervised(
 
     from docuforge.runner import check_cancelled
 
-    component = _component_for_source(source)
+    component = component_override or _component_for_source(source)
+    if component not in _MICROSOFT_COMPONENTS:
+        raise ValidationError(f"未知 Microsoft Office 组件：{component}")
     prog_id, display_name = _MICROSOFT_COMPONENTS[component]
     expected_executable = _MICROSOFT_COM_EXECUTABLES[prog_id]
     before = _windows_process_snapshot(expected_executable)
+    auxiliary_paths = tuple(path.expanduser().resolve() for path in auxiliary_executables)
+    auxiliary_before = {
+        path: _windows_process_snapshot(path.name) for path in auxiliary_paths
+    }
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=True)
     process = context.Process(
@@ -3073,14 +3368,22 @@ def _convert_com_supervised(
 
     deadline = time.monotonic() + timeout
     owned_identity: _OfficeProcessIdentity | None = None
+    owned_auxiliary: dict[Path, _OfficeProcessIdentity] = {}
+    dismissed_auxiliary_prompts: set[int] = set()
     result: Mapping[str, Any] | None = None
     try:
         while result is None:
             check_cancelled("任务已取消；正在终止 Microsoft Office 转换")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                hint = ""
+                if component == "microsoft_word" and source.suffix.lower() == ".pdf":
+                    hint = (
+                        "；Word PDF Reflow 可能被提示窗口、异常 PDF 文字层或残留进程阻塞，"
+                        "请关闭 Word 后重试，或改用页织工坊内置 PDF 转 Word 模式"
+                    )
                 raise MissingEngineError(
-                    f"Microsoft {display_name} COM 转换超时（{timeout:g} 秒）"
+                    f"Microsoft {display_name} COM 转换超时（{timeout:g} 秒）{hint}"
                 )
             try:
                 has_message = parent_connection.poll(min(0.1, remaining))
@@ -3098,24 +3401,53 @@ def _convert_com_supervised(
                             process_id = int(message.get("pid") or 0)
                         except (TypeError, ValueError):
                             process_id = 0
-                        identity = _windows_process_identity(process_id)
-                        previous = before.get(process_id)
-                        approved = bool(
-                            identity is not None
-                            and identity.executable.name.casefold()
-                            == expected_executable.casefold()
-                            and identity != previous
+                        reported_prog_id = str(message.get("prog_id") or "")
+                        reported_executable = Path(
+                            str(message.get("executable") or "")
                         )
+                        identity = None
+                        if (
+                            reported_prog_id == prog_id
+                            and reported_executable.name.casefold()
+                            == expected_executable.casefold()
+                        ):
+                            identity = _new_owned_office_process(
+                                before,
+                                expected_executable=reported_executable,
+                                reported_pid=process_id or None,
+                            )
+                        approved = identity is not None
                         if approved:
                             owned_identity = identity
                         try:
                             parent_connection.send(
-                                {"type": "ownership", "approved": approved}
+                                {
+                                    "type": "ownership",
+                                    "approved": approved,
+                                    "pid": identity.pid if identity is not None else None,
+                                }
                             )
                         except (BrokenPipeError, EOFError, OSError):
                             pass
                     elif message_type == "result":
                         result = message
+            if owned_identity is not None:
+                for executable_path in auxiliary_paths:
+                    if executable_path in owned_auxiliary:
+                        continue
+                    auxiliary = _new_owned_office_process(
+                        auxiliary_before[executable_path],
+                        expected_executable=executable_path,
+                    )
+                    if auxiliary is not None:
+                        owned_auxiliary[executable_path] = auxiliary
+                for executable_path, auxiliary in owned_auxiliary.items():
+                    if (
+                        executable_path.name.casefold() == "pdfreflow.exe"
+                        and auxiliary.pid not in dismissed_auxiliary_prompts
+                        and _dismiss_owned_pdf_reflow_prompt_once(auxiliary.pid)
+                    ):
+                        dismissed_auxiliary_prompts.add(auxiliary.pid)
             if result is None and not process.is_alive():
                 # Drain a final message that may have arrived immediately before exit.
                 try:
@@ -3131,8 +3463,24 @@ def _convert_com_supervised(
                 if result is None:
                     break
     except BaseException:
+        # PDFREFLOW can appear shortly before a timeout, after the regular
+        # polling pass last looked for auxiliaries.  Re-scan once while the
+        # exact Word instance is still owned, then terminate only the unique
+        # new executable/path/creation tuple that belongs to this operation.
+        if owned_identity is not None:
+            for executable_path in auxiliary_paths:
+                if executable_path in owned_auxiliary:
+                    continue
+                auxiliary = _new_owned_office_process(
+                    auxiliary_before[executable_path],
+                    expected_executable=executable_path,
+                )
+                if auxiliary is not None:
+                    owned_auxiliary[executable_path] = auxiliary
         if process.is_alive() or owned_identity is not None:
-            _stop_com_worker(process, owned_identity)
+            _stop_com_worker(
+                process, owned_identity, tuple(owned_auxiliary.values())
+            )
         raise
     finally:
         try:
@@ -3145,9 +3493,11 @@ def _convert_com_supervised(
     except Exception:
         pass
     if process.is_alive():
-        _stop_com_worker(process, owned_identity)
+        _stop_com_worker(process, owned_identity, tuple(owned_auxiliary.values()))
         raise MissingEngineError(f"Microsoft {display_name} COM 转换子进程未正常退出")
     _wait_for_owned_office_exit(owned_identity)
+    for auxiliary in owned_auxiliary.values():
+        _wait_for_owned_office_exit(auxiliary)
     if result is None:
         raise MissingEngineError(f"Microsoft {display_name} COM 转换进程意外退出")
     if bool(result.get("ok")):
@@ -3163,6 +3513,61 @@ def _convert_com_supervised(
     if kind == "exists":
         raise FileExistsError(error)
     raise MissingEngineError(error)
+
+
+def microsoft_pdf_to_docx(
+    source: PathLike,
+    target: PathLike,
+    *,
+    timeout: float = 900,
+) -> Path:
+    """Convert a digital PDF with Microsoft Word's native PDF Reflow engine.
+
+    This is intentionally an exact-target adapter rather than a generic Office
+    conversion engine.  The caller requests Word PDF Reflow explicitly; the
+    conversion pipeline then validates the generated DOCX without mixing it
+    with LayoutLoom's built-in reconstruction result.
+    """
+
+    source_path = Path(source).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    if not source_path.is_file():
+        raise ValidationError(f"文件不存在：{source_path}")
+    if source_path.suffix.lower() != ".pdf":
+        raise ValidationError("Microsoft Word PDF Reflow 仅支持 PDF 输入")
+    if target_path.suffix.lower() != ".docx":
+        raise ValidationError("Microsoft Word PDF Reflow 目标必须是 DOCX")
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValidationError("timeout 必须是有限且大于 0 的秒数") from exc
+    if not math.isfinite(timeout_value) or timeout_value <= 0:
+        raise ValidationError("timeout 必须是有限且大于 0 的秒数")
+
+    status = detect_office_engines().get("microsoft_word")
+    if status is None or not status.available:
+        reason = status.reason if status is not None else "未检测到 Microsoft Word"
+        raise MissingEngineError(reason)
+    word_executable = _registered_office_executable("Word.Application")
+    if word_executable is None:
+        raise MissingEngineError("Microsoft Word COM 注册路径无效")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        raise FileExistsError(f"目标文件已存在：{target_path}")
+    reflow_executable = word_executable.parent / "PDFREFLOW.EXE"
+    auxiliaries = (reflow_executable,) if reflow_executable.is_file() else ()
+    with _word_pdf_reflow_prompt_suppressed():
+        _convert_com_supervised(
+            source_path,
+            target_path,
+            "docx",
+            timeout=timeout_value,
+            component_override="microsoft_word",
+            auxiliary_executables=auxiliaries,
+        )
+    if not target_path.is_file() or target_path.stat().st_size == 0:
+        raise MissingEngineError("Microsoft Word PDF Reflow 未生成有效 DOCX")
+    return target_path
 
 
 def _select_conversion_engine(
@@ -3486,6 +3891,7 @@ __all__ = [
             "convert_with_office",
             "convert_office",
             "office_to_pdf",
+            "microsoft_pdf_to_docx",
             "OfficeEngineStatus",
         }
     )

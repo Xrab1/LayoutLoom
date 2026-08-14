@@ -479,6 +479,7 @@ def _powerpoint_presentation(
         presentation = None
         try:
             try:
+                application.Visible = False
                 application.DisplayAlerts = 1  # ppAlertsNone
                 application.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
             except Exception:
@@ -507,12 +508,19 @@ def _excel_workbook(
             application.Visible = False
             application.DisplayAlerts = False
             application.ScreenUpdating = False
+            application.EnableEvents = False
+            application.AskToUpdateLinks = False
             try:
                 application.AutomationSecurity = 3  # disable workbook macros
             except Exception:
                 pass
             workbook = application.Workbooks.Open(
-                str(source), UpdateLinks=0, ReadOnly=False, AddToMru=False
+                str(source),
+                UpdateLinks=0,
+                ReadOnly=False,
+                AddToMru=False,
+                IgnoreReadOnlyRecommended=True,
+                Notify=False,
             )
             yield application, workbook
         finally:
@@ -536,6 +544,11 @@ def _word_document(
             application.DisplayAlerts = 0
             application.ScreenUpdating = False
             try:
+                application.Options.ConfirmConversions = False
+                application.Options.SaveNormalPrompt = False
+            except Exception:
+                pass
+            try:
                 application.AutomationSecurity = 3  # disable document macros
             except Exception:
                 pass
@@ -544,7 +557,10 @@ def _word_document(
                 ConfirmConversions=False,
                 ReadOnly=False,
                 AddToRecentFiles=False,
+                Revert=False,
                 Visible=False,
+                OpenAndRepair=False,
+                NoEncodingDialog=True,
             )
             yield application, document
         finally:

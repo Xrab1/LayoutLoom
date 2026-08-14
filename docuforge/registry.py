@@ -303,14 +303,15 @@ def _pdf_operations() -> list[Operation]:
             Operation(
                 "pdf.to_word",
                 "PDF 格式转换",
-                "PDF 转 Word（混合保真 / 全文可编辑 / 整篇原样）",
-                "将数字 PDF 转为可编辑、混合保真或整篇高清原样的 Word 文档。",
+                "PDF 转 Word（版式混合 / 全文可编辑 / Word 原生 / 整篇原样）",
+                "使用内置高保真重建或 Microsoft Word 原生 PDF Reflow 生成 DOCX。",
                 lambda paths, out, p: _batch(
                     paths,
                     out,
                     {
                         "hybrid": "混合保真Word",
                         "editable": "可编辑Word",
+                        "office_native": "Office原生Word",
                         "visual": "高清原样Word",
                     }[p["mode"]],
                     ".docx",
@@ -319,6 +320,11 @@ def _pdf_operations() -> list[Operation]:
                         target,
                         password=p["password"] or None,
                         mode=p["mode"],
+                        engine=(
+                            "microsoft_office"
+                            if p["mode"] == "office_native"
+                            else "layoutloom"
+                        ),
                         dpi=p["dpi"],
                         low_quality_policy=p["low_quality_policy"],
                         hybrid_force_visual_pages=p["hybrid_force_visual_pages"],
@@ -335,14 +341,15 @@ def _pdf_operations() -> list[Operation]:
                         choices=(
                             ("hybrid", "版式优先混合（推荐）"),
                             ("editable", "全文可编辑重建"),
+                            ("office_native", "Microsoft Word 原生转换"),
                             ("visual", "整篇高清原样（不可编辑）"),
                         ),
                         help_text=(
-                            "混合模式将公式、图表和复杂表格局部高清保留，正文尽量可编辑；"
-                            "双栏论文和设计型简历会自动切换为一源页一 Word 页的固定坐标布局；"
-                            "定位节点较多时会在真实 WPS 复检保护下自动压缩为少量可编辑文字区域，失败则保留原高精度布局；"
-                            "无法安全分区或质量校验失败的页面仍可能整页高清兜底；"
-                            "全文可编辑模式尽量重建全部页面；整篇原样模式视觉最稳定"
+                            "版式优先混合：优先保持原排版，复杂论文可能使用固定坐标。\n"
+                            "全文可编辑重建：保留原有内置重建方案，尽量让所有内容可修改，适合结构简单的数字 PDF。\n"
+                            "Microsoft Word 原生转换：直接调用桌面版 Word 的 PDF Reflow，复制和常规编辑体验通常更自然；"
+                            "不与内置方案混合，复杂论文、双栏和特殊字体的结果由 Word 自身决定。未安装桌面版 Word 时会明确失败。\n"
+                            "整篇高清原样：视觉最稳定，但页面内容不可单独编辑。"
                         ),
                     ),
                     P(
@@ -361,6 +368,7 @@ def _pdf_operations() -> list[Operation]:
                             "标题、摘要为单栏而正文为双栏，或不同页面分栏不同，请选择混合分栏；不确定时保留自动识别。"
                             "整篇高清原样模式不受此选项影响。"
                         ),
+                        visible_when=("mode", ("hybrid", "editable")),
                     ),
                     P(
                         "hybrid_force_visual_pages",
@@ -371,6 +379,7 @@ def _pdf_operations() -> list[Operation]:
                             "仅版式优先混合模式生效；可手动指定必须整页高清保留的页码，"
                             "例如：1,3-5；留空则由程序自动判断"
                         ),
+                        visible_when=("mode", ("hybrid",)),
                     ),
                     P(
                         "low_quality_policy",
@@ -382,9 +391,13 @@ def _pdf_operations() -> list[Operation]:
                             ("keep", "仍保留并警告"),
                         ),
                         help_text=(
-                            "全文可编辑和版式优先混合模式生效；选择不保留时，文本完整度、排版结构或 WPS 实际分页"
+                            "全文可编辑重建、版式优先混合和 Microsoft Word 原生转换生效；选择不保留时，"
+                            "文本完整度、排版结构或 WPS 实际分页"
                             "任一最终校验失败都会停止保存；混合模式会先尽量使用局部高清或整页高清兜底。"
                             "选择仍保留时，即使最终排版或分页复检未通过也会保存成品并明确警告，供人工复核。"
+                        ),
+                        visible_when=(
+                            "mode", ("hybrid", "editable", "office_native")
                         ),
                     ),
                     P(
@@ -398,6 +411,7 @@ def _pdf_operations() -> list[Operation]:
                         ),
                         minimum=150,
                         maximum=600,
+                        visible_when=("mode", ("hybrid", "visual")),
                     ),
                     P("password", "PDF 打开密码", "password", ""),
                 ),
@@ -405,6 +419,9 @@ def _pdf_operations() -> list[Operation]:
                 capability_probe=engines.pdf_to_word_capability,
                 notes=(
                     "版式优先混合是默认模式；可由用户明确指定单栏、双栏或混合分栏，减少多栏论文的阅读顺序和排版误判。"
+                    "全文可编辑重建继续使用原有内置管线，不会自动切换到 Office 候选。"
+                    "Microsoft Word 原生转换是独立模式，直接交由桌面版 Word PDF Reflow 处理；"
+                    "程序只执行兼容性规范化和质量复检，不进行局部图像化，也不会在失败时回退到其他模式。"
                     "检测到双栏论文、复杂简历或设计型单页时，会自动采用固定坐标可编辑布局，"
                     "保留原页面尺寸、照片、装饰和图表位置，避免 Word 重排造成整页拆分或大面积空白。"
                     "复杂固定布局会先保留原逐行坐标版作为精度基线，再尝试区域级最终化；只有结构、文字、图片、"
@@ -413,6 +430,7 @@ def _pdf_operations() -> list[Operation]:
                     "以局部高清图像保留，其余可靠正文尽量保持可编辑。局部图像内的文字、公式和表格单元格不能单独编辑；"
                     "页面无法可靠分区、可编辑正文质量校验未通过或由用户指定时，仍会整页高清兜底。"
                     "全文可编辑模式会自动校验字符、英文词与词序；校验过低时可选择不保留，或仍保留并警告。"
+                    "Word 原生模式可能产生 Word 自身的文本框、分栏变化或分页差异，适合重视连续复制与常规编辑的数字 PDF。"
                     "整篇高清原样模式不可编辑，但版式与画面最稳定。"
                 ),
             ),
@@ -2981,7 +2999,7 @@ def _office_operations() -> list[Operation]:
     engine_choices = (
         ("auto", "自动：WPS → Microsoft Office → LibreOffice"),
         ("wps", "WPS Office COM"),
-        ("microsoft_office", "Microsoft Office COM（仅显式选择）"),
+        ("microsoft_office", "Microsoft Office COM（已定向适配）"),
         ("libreoffice", "LibreOffice"),
     )
     compatibility_engine_choices = engine_choices + (
@@ -3030,7 +3048,7 @@ def _office_operations() -> list[Operation]:
             capability_probe=word_renderer,
             notes=(
                 "自动模式优先使用 WPS，再尝试 Microsoft Office 与 LibreOffice；"
-                "显式选择 Microsoft Office 时失败不会偷换其他引擎。"
+                "WPS 与 Microsoft Office 均已定向适配；锁定任一引擎后失败不会偷换。"
             ),
         ),
         Operation(

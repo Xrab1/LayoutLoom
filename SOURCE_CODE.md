@@ -2,7 +2,7 @@
 
 页织工坊是采用 **GNU AGPL v3 或更高版本**发布的自由开源软件。
 
-> **运行环境提示：** 本项目主要针对桌面版 WPS Office 定向优化。受开发时间限制，Microsoft Office 与 LibreOffice 的部分功能尚不完善；普通用户建议安装 WPS，以获得最佳功能与版式体验。
+> **运行环境提示：** 本项目已对桌面版 WPS Office 与 Microsoft Office 的真实 COM 引擎完成独立识别和定向适配；自动模式按 WPS → Microsoft Office → LibreOffice 尝试，也可锁定单一引擎。LibreOffice 作为兼容回退，复杂版式建议比较本机 WPS 与 Microsoft Office 的实际结果。
 
 Windows 便携版应与同版本的 `LayoutLoom-Source-<版本>.zip`、`LICENSE`、`THIRD_PARTY_NOTICES.md` 和 `SHA256SUMS.txt` 一同发布。源码压缩包包含构建该版本所需的页织工坊源代码、测试和构建脚本；体积较大的第三方二进制引擎不重复放入源码包，其固定版本、来源和许可证见 README、准备脚本及便携包中的 `THIRD_PARTY_LICENSES`。
 
