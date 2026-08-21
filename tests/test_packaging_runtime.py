@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import runpy
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11,12 +13,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HOOK = (
-    Path(__file__).resolve().parents[1]
+    PROJECT_ROOT
     / "packaging_hooks"
     / "rthooks"
     / "layoutloom_tk_runtime.py"
 )
+BUILD_SCRIPT = PROJECT_ROOT / "build.ps1"
+RELEASE_SCRIPT = PROJECT_ROOT / "release.ps1"
+AGENT_SKILL = PROJECT_ROOT / "integrations" / "codex" / "layoutloom-agent"
 
 
 class TkRuntimeHookTests(unittest.TestCase):
@@ -168,6 +174,245 @@ class TkRuntimeHookTests(unittest.TestCase):
             self.assertIn(
                 "runtime unavailable", error_file.read_text(encoding="utf-8")
             )
+
+
+class AgentPackagingContractTests(unittest.TestCase):
+    @staticmethod
+    def _script(path: Path) -> str:
+        return path.read_text(encoding="utf-8-sig")
+
+    def test_powershell_packaging_scripts_have_valid_syntax(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is not available")
+        parser = (
+            "& { param([string]$Path) "
+            "$tokens=$null; $errors=$null; "
+            "[System.Management.Automation.Language.Parser]::ParseFile("
+            "$Path,[ref]$tokens,[ref]$errors) | Out-Null; "
+            "if($errors.Count){ $errors | ForEach-Object { "
+            "[Console]::Error.WriteLine($_.ToString()) }; exit 1 } }"
+        )
+        for script in (BUILD_SCRIPT, RELEASE_SCRIPT):
+            with self.subTest(script=script.name):
+                completed = subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        parser,
+                        str(script),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr or completed.stdout,
+                )
+
+    def test_build_contract_creates_console_cli_with_a_safe_shared_runtime(self) -> None:
+        script = self._script(BUILD_SCRIPT)
+        self.assertIn('"--name", "LayoutLoom-CLI"', script)
+        self.assertIn('"--console"', script)
+        self.assertIn('$protocol.commands -notcontains "quick-run"', script)
+        self.assertIn(
+            '$cliEntryPoint = Join-Path $projectRoot "agent_launcher.py"', script
+        )
+        self.assertIn("function Merge-CompatiblePyInstallerRuntime", script)
+        self.assertIn(
+            "Merge-CompatiblePyInstallerRuntime -SourceDirectory "
+            "$cliSourceInternal -DestinationDirectory $bundleInternal",
+            script,
+        )
+        self.assertIn(
+            "The GUI and Agent CLI PyInstaller runtimes conflict", script
+        )
+        self.assertNotIn(
+            "Copy-Item -LiteralPath $item.FullName -Destination "
+            "$bundleInternal -Recurse -Force",
+            script,
+        )
+
+    def test_shared_runtime_merge_preserves_identical_files_and_rejects_conflicts(
+        self,
+    ) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is not available")
+        command = (
+            "& { param([string]$BuildScript,[string]$SourceDirectory,"
+            "[string]$DestinationDirectory) "
+            "$tokens=$null; $errors=$null; "
+            "$ast=[System.Management.Automation.Language.Parser]::ParseFile("
+            "$BuildScript,[ref]$tokens,[ref]$errors); "
+            "if($errors.Count){ throw ($errors -join [Environment]::NewLine) }; "
+            "$function=$ast.Find({ param($node) "
+            "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+            "-and $node.Name -eq 'Merge-CompatiblePyInstallerRuntime' },$true); "
+            "if($null -eq $function){ throw 'Runtime merge function is missing.' }; "
+            "Invoke-Expression $function.Extent.Text; "
+            "Merge-CompatiblePyInstallerRuntime -SourceDirectory $SourceDirectory "
+            "-DestinationDirectory $DestinationDirectory }"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "cli-internal"
+            destination = root / "gui-internal"
+            (source / "package").mkdir(parents=True)
+            destination.mkdir()
+            (source / "shared.bin").write_bytes(b"same-runtime")
+            (destination / "shared.bin").write_bytes(b"same-runtime")
+            (source / "package" / "cli-only.dat").write_bytes(b"agent")
+            source_zip_info = zipfile.ZipInfo(
+                "encodings/__init__.pyc", date_time=(2020, 1, 1, 0, 0, 0)
+            )
+            source_zip_info.compress_type = zipfile.ZIP_STORED
+            destination_zip_info = zipfile.ZipInfo(
+                "encodings/__init__.pyc", date_time=(2024, 1, 1, 0, 0, 0)
+            )
+            destination_zip_info.compress_type = zipfile.ZIP_DEFLATED
+            with zipfile.ZipFile(source / "base_library.zip", "w") as package:
+                package.writestr(source_zip_info, b"same-stdlib-module")
+            with zipfile.ZipFile(destination / "base_library.zip", "w") as package:
+                package.writestr(destination_zip_info, b"same-stdlib-module")
+            invocation = [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+                str(BUILD_SCRIPT),
+                str(source),
+                str(destination),
+            ]
+            compatible = subprocess.run(
+                invocation,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(
+                compatible.returncode,
+                0,
+                compatible.stderr or compatible.stdout,
+            )
+            self.assertEqual(
+                (destination / "package" / "cli-only.dat").read_bytes(), b"agent"
+            )
+            self.assertEqual(
+                (destination / "shared.bin").read_bytes(), b"same-runtime"
+            )
+            with zipfile.ZipFile(destination / "base_library.zip") as package:
+                self.assertEqual(
+                    package.read("encodings/__init__.pyc"), b"same-stdlib-module"
+                )
+
+            (source / "shared.bin").write_bytes(b"DIFF-runtime")
+            conflict = subprocess.run(
+                invocation,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertIn(
+                "PyInstaller runtimes conflict",
+                conflict.stderr + conflict.stdout,
+            )
+
+            (source / "shared.bin").write_bytes(b"same-runtime")
+            with zipfile.ZipFile(source / "base_library.zip", "w") as package:
+                package.writestr(source_zip_info, b"DIFF-stdlib-module")
+            zip_conflict = subprocess.run(
+                invocation,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertNotEqual(zip_conflict.returncode, 0)
+            self.assertIn(
+                "base_library.zip",
+                zip_conflict.stderr + zip_conflict.stdout,
+            )
+
+    def test_portable_bundle_contract_includes_cli_and_complete_skill(self) -> None:
+        build_script = self._script(BUILD_SCRIPT).replace("\\", "/")
+        release_script = self._script(RELEASE_SCRIPT).replace("\\", "/")
+        self.assertIn(
+            '$agentSkillTarget = Join-Path $bundleDirectory '
+            '"agent_skill/layoutloom-agent"',
+            build_script,
+        )
+        for relative in (
+            "SKILL.md",
+            "agents/openai.yaml",
+            "scripts/layoutloom_agent.py",
+            "references/protocol.md",
+        ):
+            self.assertTrue((AGENT_SKILL / relative).is_file(), relative)
+            self.assertIn(
+                f'"LayoutLoom/agent_skill/layoutloom-agent/{relative}"',
+                release_script,
+            )
+        self.assertIn('"LayoutLoom/LayoutLoom-CLI.exe"', release_script)
+        self.assertIn('"LayoutLoom/AGENT_INTEGRATION.md"', release_script)
+        self.assertIn('"AGENT_INTEGRATION.md"', build_script)
+
+    def test_portable_skill_wrapper_finds_sibling_cli(self) -> None:
+        namespace = runpy.run_path(
+            str(AGENT_SKILL / "scripts" / "layoutloom_agent.py"),
+            run_name="layoutloom_portable_skill_test",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            bundle = Path(folder) / "LayoutLoom"
+            skill_root = bundle / "agent_skill" / "layoutloom-agent"
+            skill_root.mkdir(parents=True)
+            cli = bundle / "LayoutLoom-CLI.exe"
+            cli.touch()
+            with patch.dict(os.environ, {}, clear=True):
+                command = namespace["locate_command"](skill_root)
+            self.assertEqual(command, [str(cli.resolve())])
+
+    def test_source_archive_contract_includes_agent_bridge(self) -> None:
+        script = self._script(RELEASE_SCRIPT).replace("\\", "/")
+        self.assertIn('$protocol.commands -notcontains "quick-run"', script)
+        self.assertIn(
+            '$sourceDirectories = @("docuforge", "tests", '
+            '"packaging_hooks", "integrations")',
+            script,
+        )
+        self.assertIn('"agent_launcher.py"', script)
+        self.assertIn("function Assert-SourceArchiveContents", script)
+        self.assertIn(
+            "Assert-SourceArchiveContents -ArchivePath $sourceZip "
+            "-Version $version",
+            script,
+        )
+        for relative in (
+            "AGENT_INTEGRATION.md",
+            "agent_launcher.py",
+            "docuforge/agent_api.py",
+            "docuforge/cli.py",
+            "integrations/codex/layoutloom-agent/SKILL.md",
+            "integrations/codex/layoutloom-agent/agents/openai.yaml",
+            "integrations/codex/layoutloom-agent/scripts/layoutloom_agent.py",
+            "integrations/codex/layoutloom-agent/references/protocol.md",
+            "tests/test_agent_api.py",
+            "tests/test_agent_cli.py",
+        ):
+            self.assertIn(f'"$root/{relative}"', script)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .models import (
     CancelledError,
+    Capability,
     DocuForgeError,
     MissingEngineError,
     Operation,
@@ -305,6 +306,7 @@ class TaskRunner:
         output_dir: str | Path,
         raw_parameters: Mapping[str, Any] | None = None,
         progress: ProgressCallback | None = None,
+        capability_override: Capability | None = None,
     ) -> TaskResult:
         callback = progress or (lambda _value, _message: None)
         if self.cancel_event.is_set():
@@ -324,7 +326,7 @@ class TaskRunner:
             last_progress = normalized
             callback(normalized, message)
 
-        capability = operation.capability()
+        capability = capability_override or operation.capability()
         if not capability.runnable:
             raise MissingEngineError(capability.reason)
         emit(

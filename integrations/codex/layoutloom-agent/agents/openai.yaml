@@ -1,0 +1,4 @@
+interface:
+  display_name: "LayoutLoom 文件处理"
+  short_description: "一次调用本地 PDF、Office、图片与视频处理任务"
+  default_prompt: "Use $layoutloom-agent with one quick-run call; for Word, Excel, or PowerPoint to PDF on this WPS-optimized installation, explicitly select the WPS engine and follow the bounded wait/cancel rules."

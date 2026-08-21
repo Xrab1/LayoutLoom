@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "layoutloom"
-version = "0.1.1"
+version = "0.2.0"
 description = "页织工坊：本地优先的 PDF、Office、图片与视频批处理桌面工具"
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
@@ -39,6 +39,7 @@ dependencies = [
 
 [project.scripts]
 layoutloom = "docuforge.cli:main"
+layoutloom-agent = "docuforge.cli:agent_main"
 layoutloom-gui = "docuforge.app:launch"
 
 [tool.setuptools.packages.find]

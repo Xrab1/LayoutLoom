@@ -25,7 +25,7 @@ from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen.canvas import Canvas
 
-from docuforge.processors.office import convert_with_office
+from docuforge.processors.office import convert_with_office, detect_office_engines
 from docuforge.processors.video import detect_video_engine
 from docuforge.processors.video_slide_repair import make_plan
 from docuforge.registry import get_operations
@@ -613,14 +613,29 @@ def audit(fixtures: dict[str, Path]) -> None:
         run_case("video_trim", "video.trim", slide_video, {"format": "mp4", "start": "0.5", "end": "2.5", "duration": "", "quality": 28})
     run_case("video_extract_audio", "video.extract_audio", [fixtures["audio_video"]], {"sample_rate": "22050", "channels": "1"})
 
-    for operation_id in ("word.to_pdf", "excel.to_pdf", "ppt.to_pdf"):
-        expect_failure(
-            "explicit_microsoft_unavailable_" + operation_id.replace(".", "_"),
-            operation_id,
-            [fixtures[{"word.to_pdf": "docx", "excel.to_pdf": "xlsx", "ppt.to_pdf": "pptx"}[operation_id]]],
-            {"engine": "microsoft_office"},
-            "Microsoft",
-        )
+    microsoft_statuses = detect_office_engines()
+    microsoft_cases = {
+        "word.to_pdf": ("docx", "microsoft_word"),
+        "excel.to_pdf": ("xlsx", "microsoft_excel"),
+        "ppt.to_pdf": ("pptx", "microsoft_powerpoint"),
+    }
+    for operation_id, (fixture_key, component_key) in microsoft_cases.items():
+        status = microsoft_statuses[component_key]
+        if status.available:
+            run_case(
+                "explicit_microsoft_available_" + operation_id.replace(".", "_"),
+                operation_id,
+                [fixtures[fixture_key]],
+                {"engine": "microsoft_office"},
+            )
+        else:
+            expect_failure(
+                "explicit_microsoft_unavailable_" + operation_id.replace(".", "_"),
+                operation_id,
+                [fixtures[fixture_key]],
+                {"engine": "microsoft_office"},
+                "Microsoft",
+            )
 
 
 def write_report() -> None:

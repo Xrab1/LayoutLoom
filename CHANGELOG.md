@@ -2,6 +2,44 @@
 
 本项目遵循语义化版本号。详细下载说明与二进制附件请查看 GitHub Releases。
 
+## v0.2.0（2026-08-21）
+
+### Agent Bridge
+
+- 新增独立的 `LayoutLoom-CLI.exe`，便携版无需安装 Python 即可被本地 Agent、脚本和自动化工具调用。
+- 新增版本化 UTF-8 JSON/JSONL 协议，支持 `protocol`、`catalog`、`describe`、`validate`、`run`、`quick-run` 和 `install-skill`。
+- 新增一次调用 `quick-run`：已知任务无需创建请求文件或重复执行发现/独立预校验，仍复用完整运行时安全与输出校验。
+- 最终结果增加 Agent 前置校验与总耗时指标，便于区分引擎耗时和调用编排耗时。
+- Office 快速任务在 WPS 优化环境中显式锁定 WPS，避免自动探测误入耗时的 Microsoft Office 回退链。
+- WPS COM 改为受监督隔离子进程，加入精确进程组回收和未完成临时文件清理；Agent 快速 Office 任务采用 90 秒外层等待边界并在超时后进入有界清理，底层 API 仍尊重调用方传入的 `timeout`；正常转换不再残留自动化实例。
+- WPS 任务进程采用 PID、规范化可执行文件路径、创建时间及 `/Automation -Embedding` 参数四重核验；PID 复用或身份变化时拒绝认领，避免影响用户自行打开的 WPS 实例。
+- Codex Skill 包装器同步等待真实 CLI，并在取消时仅转发一次中断、有限等待清理，避免旧会话未退出时产生孤儿任务或重复重试。
+- Agent 常见 Office 转 PDF 流程不再预查同名输出、不再重复运行发现和独立预校验，也不会在仍运行的终端会话内重试；同名结果由页织工坊自动生成唯一文件名。
+- 73 项核心功能继续统一复用现有注册表和 `TaskRunner`，不维护第二套处理逻辑。
+- 支持实时进度事件、批量部分成功、逐文件失败记录、取消结果和稳定退出码。
+- `validate` 可在不创建输出的情况下检查任务 ID、输入文件、参数、路径范围和本机处理引擎。
+- 能力目录默认不执行耗时的全量引擎探测；按需使用 `--probe` 或单项 `describe/validate`。
+- 目录搜索支持跨任务 ID、名称和说明的多关键词匹配，例如 `PDF Word` 可直接发现双向转换及相关工具。
+
+### Agent 安全与兼容
+
+- JSON 请求拒绝重复字段、未知字段和未知参数，并限制为 1 MiB，减少错误或恶意请求造成的风险。
+- 密码参数不会出现在目录默认值、验证结果、进度或最终结果中。
+- 支持由宿主通过多个 `--allow-root` 限制输入、输出和辅助资源路径；请求文件不能自行扩大权限。
+- Agent 模式默认禁止 `image.rename` 的 `move=true`，只有用户明确授权 `--allow-source-mutation` 后才允许移动原文件。
+- `video.repair_slides_ppt` 会明确标记为需要 GUI 预先生成补修方案，避免 Agent 凭空构造交互数据。
+- PDF→Word 选择 Microsoft Word 原生模式时执行参数感知的 Word 可用性预检。
+- 显式选择 WPS、Microsoft Office 或 LibreOffice 时，校验与实际运行共用同一参数感知能力结果；相对辅助资源路径统一按请求文件目录解析。
+- JSONL 协议输出与处理器普通 stdout 分离，并统一强制 UTF-8，改善中文路径和跨 Agent 解析兼容性。
+
+### Codex Skill 与分发
+
+- 新增可安装的 `layoutloom-agent` Skill：明确的常见另存任务默认走“一次调用→核验输出”，未知或复杂任务才进入“查询能力→描述参数→预校验→执行”。
+- 便携包内置 Skill、协议参考和定位包装脚本，可通过 `LayoutLoom-CLI.exe agent install-skill` 安装或升级。
+- Skill 安装会写入当前 CLI 的绝对位置；覆盖升级前自动备份已有 Skill。
+- 构建与发布流程新增冻结 CLI、操作目录、Skill 文件和解压后协议自检。
+- MCP 暂不作为首发必需服务；未来可将其作为 JSON CLI 的薄封装，避免常驻进程直接承载耗时 Office 和视频任务。
+
 ## v0.1.1（2026-08-14）
 
 ### PDF 转 Word

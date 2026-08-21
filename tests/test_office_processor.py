@@ -638,7 +638,7 @@ class OfficeEngineSelectionTests(unittest.TestCase):
                 "docuforge.processors.wps.detect_wps_engines",
                 return_value=wps_statuses,
             ), patch(
-                "docuforge.processors.wps.convert_with_wps",
+                "docuforge.processors.wps.convert_with_wps_supervised",
                 side_effect=convert_wps,
             ) as convert_wps:
                 result = office.convert_with_office(
@@ -650,6 +650,7 @@ class OfficeEngineSelectionTests(unittest.TestCase):
             root / "out",
             "pdf",
             overwrite=False,
+            timeout=180.0,
             excel_pdf_layout="smart",
             excel_pdf_paper="auto",
             excel_pdf_orientation="auto",
@@ -1401,7 +1402,8 @@ class OfficeEngineSelectionTests(unittest.TestCase):
                 "docuforge.processors.wps.detect_wps_engines",
                 return_value=wps_statuses,
             ), patch(
-                "docuforge.processors.wps.convert_with_wps", return_value=[missing]
+                "docuforge.processors.wps.convert_with_wps_supervised",
+                return_value=[missing],
             ):
                 with self.assertRaisesRegex(MissingEngineError, "未生成有效输出文件"):
                     office.convert_with_office(

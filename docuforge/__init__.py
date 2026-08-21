@@ -3,4 +3,4 @@
 from .models import Capability, Operation, ParameterSpec, TaskResult
 
 __all__ = ["Capability", "Operation", "ParameterSpec", "TaskResult"]
-__version__ = "0.1.1"
+__version__ = "0.2.0"

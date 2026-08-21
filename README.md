@@ -188,7 +188,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 发布时必须同时提供便携包、源码包、许可证与校验值。AGPL 义务和源码对应关系见 `SOURCE_CODE.md`；第三方许可证见 `THIRD_PARTY_NOTICES.md` 和便携包内的 `THIRD_PARTY_LICENSES`。当前发布目标为 Windows 10/11 x64；不能承诺所有裁剪版 Windows、旧版系统、损坏文件或特殊 Office 安装都可无差异运行。
 
-## 命令行
+## 命令行与 Agent 自动化
+
+### 面向人工的简洁命令
 
 列出当前 73 个核心任务：
 
@@ -205,6 +207,96 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 .\.venv\Scripts\layoutloom.exe run image.resize .\照片\*.jpg `
   -o .\输出 -p width=1920 -p height=1080 -p keep_aspect=true
 ```
+
+### 面向 Agent 的稳定 JSON CLI（v0.2.0）
+
+页织工坊 v0.2.0 新增本地 Agent 接口。它与 GUI 共用同一任务目录和处理引擎，但使用 UTF-8 JSON 请求、JSON Lines 实时事件和稳定退出码，更适合 Codex、其他编程 Agent、自动化脚本及后续 MCP 适配器调用。完整说明见 [`AGENT_INTEGRATION.md`](AGENT_INTEGRATION.md)。
+
+源码环境运行 `install.ps1` 后可使用 `layoutloom-agent.exe`；便携版使用与 `LayoutLoom.exe` 同目录的 `LayoutLoom-CLI.exe`：
+
+```powershell
+# 源码环境
+.\.venv\Scripts\layoutloom-agent.exe protocol --pretty
+.\.venv\Scripts\layoutloom-agent.exe catalog --query "PDF 合并" --pretty
+.\.venv\Scripts\layoutloom-agent.exe describe pdf.merge --pretty
+
+# 已知任务的一次调用快速路径（内部仍执行完整校验）
+.\.venv\Scripts\layoutloom-agent.exe quick-run word.to_pdf `
+  "C:\资料\合同.docx" --output-dir "C:\资料\输出" `
+  --param engine=wps --allow-root "C:\资料" --format jsonl
+
+# 便携版中的等价命令
+.\LayoutLoom-CLI.exe agent protocol --pretty
+```
+
+对 `word.to_pdf`、`excel.to_pdf`、`ppt.to_pdf`、`pdf.merge` 等已知、非破坏性且参数明确的任务，Agent 应直接使用 `quick-run`，避免重复启动 `protocol/catalog/describe/validate` 进程。当前 WPS 优化安装中的三项 Office 转 PDF 应显式传入 `engine=wps`。`quick-run` 与 `run` 共用完整的请求、路径、引擎、取消和输出校验，只省略冗余发现过程及单独的 dry-run；Agent 快速 Office 任务采用 90 秒外层等待边界，超过边界后进入一次温和取消与有界清理。底层 Office API 不硬编码该时限，始终尊重调用方传入的 `timeout`。
+
+任务 ID、参数或外部引擎不确定时，不要猜测：先执行 `catalog`，再用 `describe` 读取完整参数定义。复杂批量、敏感参数、多辅助资源或可能移动源文件的任务应创建请求并先运行无写入的 `validate`。最小请求文件示例：
+
+```json
+{
+  "schema_version": "1.0",
+  "request_id": "merge-example-001",
+  "operation": "pdf.merge",
+  "inputs": [
+    "D:\\资料\\封面.pdf",
+    "D:\\资料\\正文.pdf"
+  ],
+  "output_dir": "D:\\资料\\输出",
+  "parameters": {
+    "filename": "完整文档"
+  }
+}
+```
+
+```powershell
+.\.venv\Scripts\layoutloom-agent.exe validate --request .\request.json --pretty `
+  --allow-root "D:\资料"
+
+.\.venv\Scripts\layoutloom-agent.exe run --request .\request.json --format jsonl `
+  --allow-root "D:\资料"
+```
+
+`run --format jsonl` 的标准输出每行都是一个 JSON 对象。调用方必须等到最终 `result` 或 `error`，不能把 `accepted`、中间 `progress`，甚至 `progress=100` 当作任务完成。批量任务中的单个文件失败时，独立任务会继续处理其余文件；最终结果会同时列出成功输出和失败输入。
+
+Agent CLI 的稳定退出码为：
+
+| 退出码 | 含义 |
+| ---: | --- |
+| `0` | 全部成功 |
+| `2` | 请求、参数、路径或命令行用法错误 |
+| `3` | 所需本机引擎不可用 |
+| `4` | 可预期的处理失败 |
+| `5` | 批量任务部分成功；保留成功输出并检查失败清单 |
+| `70` | 未预期的内部错误 |
+| `130` | 已取消；检查结果中的已保留输出 |
+
+安全边界如下：
+
+- JSON 请求最大 1 MiB；重复字段、未知字段、未知参数、错误格式和不受支持的输入会被拒绝。
+- 可重复提供 `--allow-root`，把输入、输出和路径型参数限制在用户授权的目录内。
+- `image.rename` 的 `move=true` 默认被 Agent 模式禁止；只有用户明确授权且宿主添加 `--allow-source-mutation` 时才可移动原文件。
+- 密码应只写入临时请求文件，不应放在命令行或日志中；CLI 不会在校验或结果中回显敏感参数值。
+- `Ctrl+C`、`SIGTERM` 或 Windows `SIGBREAK` 会请求优雅取消：已完成输出保留，未完成临时文件会清理。调用方应先等待清理完成，不要直接强杀进程。
+- `video.repair_slides_ppt` 仍是 GUI 辅助任务，必须先在页织工坊快速补修窗口创建有效方案；Agent 不能凭空生成交互式框选信息。
+
+### 安装 Codex Skill
+
+便携版已经携带 `agent_skill\layoutloom-agent`，可执行：
+
+```powershell
+.\LayoutLoom-CLI.exe agent install-skill --pretty
+```
+
+源码环境可执行：
+
+```powershell
+.\.venv\Scripts\layoutloom-agent.exe install-skill --pretty
+```
+
+升级已有 Skill 时添加 `--force`。安装器会写入当前 LayoutLoom CLI 的实际位置；完成后重新打开 Codex，即可让 Codex 按“查询目录 → 描述参数 → 创建请求 → 校验 → 执行 → 核验输出”的流程调用本机页织工坊。也可用 `--skills-dir` 指定其他 Codex skills 根目录。
+
+当前版本有意不内置常驻 MCP Server。页织工坊的主要工作是本地、长耗时、可取消的文件任务，JSON CLI 能在源码版和便携版中零配置运行，不需要开放端口、维持后台进程或引入额外服务权限；Codex Skill 已提供自然语言入口，其他 Agent 也可以直接消费相同协议。未来若确有多会话共享、远程能力发现或集中作业队列需求，可把稳定 CLI 封装成薄 MCP 层，而不改变现有任务实现。
 
 ## 测试
 

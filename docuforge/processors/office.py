@@ -3668,13 +3668,14 @@ def _convert_with_selected_engine(
     excel_pdf_margin: str,
 ) -> list[Path]:
     if selected == "wps":
-        from .wps import convert_with_wps
+        from .wps import convert_with_wps_supervised
 
-        outputs = convert_with_wps(
+        outputs = convert_with_wps_supervised(
             source,
             output_dir,
             target_format,
             overwrite=overwrite,
+            timeout=timeout,
             excel_pdf_layout=excel_pdf_layout,
             excel_pdf_paper=excel_pdf_paper,
             excel_pdf_orientation=excel_pdf_orientation,

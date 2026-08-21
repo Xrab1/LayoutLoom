@@ -16,6 +16,102 @@ function Assert-NativeSuccess {
     }
 }
 
+function Merge-CompatiblePyInstallerRuntime {
+    param(
+        [string]$SourceDirectory,
+        [string]$DestinationDirectory
+    )
+
+    function Get-ZipEntryFingerprints {
+        param([string]$ArchivePath)
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        $fingerprints = @{}
+        try {
+            foreach ($entry in $archive.Entries) {
+                if ($fingerprints.ContainsKey($entry.FullName)) {
+                    throw "Duplicate ZIP entry in PyInstaller runtime: $($entry.FullName)"
+                }
+                $stream = $entry.Open()
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try {
+                    $digest = [System.BitConverter]::ToString(
+                        $sha.ComputeHash($stream)
+                    ).Replace("-", "")
+                } finally {
+                    $sha.Dispose()
+                    $stream.Dispose()
+                }
+                $fingerprints[$entry.FullName] = "$($entry.Length):$digest"
+            }
+        } finally {
+            $archive.Dispose()
+        }
+        return $fingerprints
+    }
+
+    function Test-ZipArchiveContentEqual {
+        param([string]$FirstPath, [string]$SecondPath)
+        try {
+            $first = Get-ZipEntryFingerprints -ArchivePath $FirstPath
+            $second = Get-ZipEntryFingerprints -ArchivePath $SecondPath
+        } catch {
+            return $false
+        }
+        if ($first.Count -ne $second.Count) {
+            return $false
+        }
+        foreach ($name in $first.Keys) {
+            if (-not $second.ContainsKey($name) -or $first[$name] -ne $second[$name]) {
+                return $false
+            }
+        }
+        return $true
+    }
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
+        throw "The PyInstaller runtime source directory is missing: $SourceDirectory"
+    }
+    if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+        throw "The PyInstaller runtime destination directory is missing: $DestinationDirectory"
+    }
+
+    $sourceRoot = [System.IO.Path]::GetFullPath($SourceDirectory).TrimEnd('\') + '\'
+    foreach ($sourceFile in Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File -Force) {
+        if (-not $sourceFile.FullName.StartsWith($sourceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Unexpected PyInstaller runtime path: $($sourceFile.FullName)"
+        }
+        $relativePath = $sourceFile.FullName.Substring($sourceRoot.Length)
+        $destinationFile = Join-Path $DestinationDirectory $relativePath
+        $destinationParent = Split-Path -Parent $destinationFile
+        New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+
+        if (Test-Path -LiteralPath $destinationFile -PathType Leaf) {
+            $destinationInfo = Get-Item -LiteralPath $destinationFile
+            $compatible = $false
+            if ($sourceFile.Length -eq $destinationInfo.Length) {
+                $sourceHash = (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash
+                $destinationHash = (Get-FileHash -LiteralPath $destinationFile -Algorithm SHA256).Hash
+                $compatible = $sourceHash -eq $destinationHash
+            }
+            if (-not $compatible -and $sourceFile.Extension -ieq ".zip") {
+                $compatible = Test-ZipArchiveContentEqual `
+                    -FirstPath $sourceFile.FullName `
+                    -SecondPath $destinationFile
+            }
+            if (-not $compatible) {
+                throw "The GUI and Agent CLI PyInstaller runtimes conflict at '$relativePath'."
+            }
+            continue
+        }
+        if (Test-Path -LiteralPath $destinationFile) {
+            throw "The Agent CLI runtime file collides with a directory: $destinationFile"
+        }
+        Copy-Item -LiteralPath $sourceFile.FullName -Destination $destinationFile -Force
+    }
+}
+
 function Stop-FrozenProcessTree {
     param([System.Diagnostics.Process]$Process)
     try {
@@ -157,6 +253,47 @@ function Invoke-FrozenSelfTest {
             }
             throw "$Description failed with exit code $($process.ExitCode).$diagnostic"
         }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Invoke-FrozenCliProbe {
+    param(
+        [string]$Executable,
+        [string]$Arguments,
+        [string]$Description,
+        [int]$TimeoutMilliseconds = 60000
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = $Arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "$Description could not be started."
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            Stop-FrozenProcessTree -Process $process
+            throw "$Description timed out."
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $process.Refresh()
+        if ($process.ExitCode -ne 0) {
+            throw "$Description failed with exit code $($process.ExitCode).`n$stderr"
+        }
+        return $stdout.Trim()
     } finally {
         $process.Dispose()
     }
@@ -322,6 +459,70 @@ try {
         }
     }
 
+    $cliBuildArgs = @()
+    for ($index = 0; $index -lt $buildArgs.Count; $index++) {
+        $argument = [string]$buildArgs[$index]
+        if ($argument -eq "--windowed") {
+            $cliBuildArgs += "--console"
+            continue
+        }
+        if ($argument -eq "--name") {
+            $cliBuildArgs += @("--name", "LayoutLoom-CLI")
+            $index += 1
+            continue
+        }
+        $cliBuildArgs += $buildArgs[$index]
+    }
+    $cliBuildRoot = Join-Path $projectRoot "build\agent-cli"
+    $cliDistRoot = Join-Path $cliBuildRoot "dist"
+    $cliWorkRoot = Join-Path $cliBuildRoot "work"
+    $cliSpecRoot = Join-Path $cliBuildRoot "spec"
+    New-Item -ItemType Directory -Path $cliSpecRoot -Force | Out-Null
+    $cliBuildArgs += @(
+        "--distpath", $cliDistRoot,
+        "--workpath", $cliWorkRoot,
+        "--specpath", $cliSpecRoot
+    )
+    $cliEntryPoint = Join-Path $projectRoot "agent_launcher.py"
+    if (-not (Test-Path -LiteralPath $cliEntryPoint -PathType Leaf)) {
+        throw "The Agent CLI entry point is missing: $cliEntryPoint"
+    }
+    & $pythonExe -m PyInstaller @cliBuildArgs $cliEntryPoint
+    Assert-NativeSuccess "LayoutLoom Agent CLI build failed"
+    $cliBundle = Join-Path $cliDistRoot "LayoutLoom-CLI"
+    $cliSourceExe = Join-Path $cliBundle "LayoutLoom-CLI.exe"
+    $cliSourceInternal = Join-Path $cliBundle "_internal"
+    $cliExePath = Join-Path $bundleDirectory "LayoutLoom-CLI.exe"
+    if (-not (Test-Path -LiteralPath $cliSourceExe -PathType Leaf)) {
+        throw "The Agent CLI build did not produce LayoutLoom-CLI.exe."
+    }
+    if (-not (Test-Path -LiteralPath $cliSourceInternal -PathType Container)) {
+        throw "The Agent CLI build is missing its shared runtime directory."
+    }
+    Copy-Item -LiteralPath $cliSourceExe -Destination $cliExePath -Force
+    Merge-CompatiblePyInstallerRuntime -SourceDirectory $cliSourceInternal -DestinationDirectory $bundleInternal
+    if ((Get-Item -LiteralPath $cliExePath).Length -le 0) {
+        throw "The packaged Agent CLI executable is empty."
+    }
+
+    $agentSkillSource = Join-Path $projectRoot "integrations\codex\layoutloom-agent"
+    $agentSkillTarget = Join-Path $bundleDirectory "agent_skill\layoutloom-agent"
+    if (-not (Test-Path -LiteralPath (Join-Path $agentSkillSource "SKILL.md") -PathType Leaf)) {
+        throw "The distributable LayoutLoom Agent Skill is missing."
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $agentSkillTarget) -Force | Out-Null
+    Copy-Item -LiteralPath $agentSkillSource -Destination $agentSkillTarget -Recurse -Force
+    foreach ($requiredSkillFile in @(
+        (Join-Path $agentSkillTarget "SKILL.md"),
+        (Join-Path $agentSkillTarget "agents\openai.yaml"),
+        (Join-Path $agentSkillTarget "scripts\layoutloom_agent.py"),
+        (Join-Path $agentSkillTarget "references\protocol.md")
+    )) {
+        if (-not (Test-Path -LiteralPath $requiredSkillFile -PathType Leaf)) {
+            throw "The packaged Agent Skill is incomplete: $requiredSkillFile"
+        }
+    }
+
     $bundleFfmpeg = Join-Path $bundleDirectory "ffmpeg"
     $bundlePoppler = Join-Path $bundleDirectory "poppler"
     New-Item -ItemType Directory -Path (Join-Path $bundleFfmpeg "bin") -Force | Out-Null
@@ -336,7 +537,7 @@ try {
     }
     Copy-Item -LiteralPath $portablePoppler -Destination $bundlePoppler -Recurse -Force
 
-    foreach ($name in @("LICENSE", "README.md", "SOURCE_CODE.md", "THIRD_PARTY_NOTICES.md")) {
+    foreach ($name in @("LICENSE", "README.md", "AGENT_INTEGRATION.md", "CHANGELOG.md", "SOURCE_CODE.md", "THIRD_PARTY_NOTICES.md")) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $bundleDirectory $name) -Force
     }
     $thirdPartyLicenses = Join-Path $bundleDirectory "THIRD_PARTY_LICENSES"
@@ -425,9 +626,23 @@ try {
         }
     }
     Write-Host "Executable and Tcl/Tk recovery self-tests passed."
+    $protocol = Invoke-FrozenCliProbe -Executable $cliExePath -Arguments "agent protocol" -Description "The frozen Agent protocol probe" | ConvertFrom-Json
+    if (
+        $protocol.protocol.name -ne "layoutloom-agent" -or
+        $protocol.protocol.version -ne "1.0" -or
+        $protocol.commands -notcontains "quick-run"
+    ) {
+        throw "The frozen Agent CLI returned an unexpected protocol descriptor."
+    }
+    $catalog = Invoke-FrozenCliProbe -Executable $cliExePath -Arguments "agent catalog --query pdf.merge" -Description "The frozen Agent catalog probe" | ConvertFrom-Json
+    if ($catalog.count -ne 1 -or $catalog.operations[0].id -ne "pdf.merge") {
+        throw "The frozen Agent CLI could not query the operation catalog."
+    }
+    Write-Host "Agent CLI protocol, catalog, and bundled Skill self-tests passed."
 } finally {
     Pop-Location
 }
 
 Write-Host ("Build complete: {0}" -f $exePath)
+Write-Host ("Agent CLI: {0}" -f $cliExePath)
 Write-Host ("Copy the complete application folder: {0}" -f $bundleDirectory)
